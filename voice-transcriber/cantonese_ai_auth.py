@@ -49,6 +49,9 @@ MISSING_SECRET_MESSAGE = (
 # Refresh this many seconds before the access token expires.
 REFRESH_MARGIN_S = 120
 HTTP_TIMEOUT_S = 30
+# Cloudflare in front of cantonese.ai answers Python's default User-Agent ("Python-urllib/3.x") with
+# 403 "error code: 1010" before the request reaches the API, so every request names this agent.
+USER_AGENT = "whatsapp-agent (+https://github.com/cantonese-ai/whatsapp-agent)"
 
 log = logging.getLogger("cantonese-ai-auth")
 
@@ -102,7 +105,9 @@ def discover(issuer=DEFAULT_ISSUER, timeout=DISCOVERY_TIMEOUT_S):
     endpoints = {"authorization_endpoint": f"{issuer}/api/oauth/authorize",
                  "token_endpoint": f"{issuer}/api/oauth/token"}
     try:
-        with urllib.request.urlopen(f"{issuer}/.well-known/oauth-authorization-server", timeout=timeout) as r:
+        req = urllib.request.Request(f"{issuer}/.well-known/oauth-authorization-server",
+                                     headers={"user-agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             meta = json.loads(r.read())
         for key in endpoints:
             if isinstance(meta.get(key), str) and meta[key].startswith(("https://", "http://")):
@@ -142,7 +147,7 @@ def parse_callback(url_or_query, expected_state):
 def _token_request(token_endpoint, fields, timeout=HTTP_TIMEOUT_S):
     req = urllib.request.Request(token_endpoint, data=urllib.parse.urlencode(fields).encode(), method="POST",
                                  headers={"content-type": "application/x-www-form-urlencoded",
-                                          "accept": "application/json"})
+                                          "accept": "application/json", "user-agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = json.loads(r.read())

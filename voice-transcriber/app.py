@@ -290,7 +290,8 @@ def backoff_s(attempt, retry_after=None):
 
 def post_json(url, body, headers, timeout=60):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"content-type": "application/json", **headers})
+                                 headers={"content-type": "application/json",
+                                          "user-agent": cantonese_ai_auth.USER_AGENT, **headers})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
@@ -305,7 +306,8 @@ def post_multipart(url, fields, files, headers, timeout=300):
                      f'Content-Type: {ctype}\r\n\r\n'.encode() + data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     req = urllib.request.Request(url, data=b"".join(parts), method="POST",
-                                 headers={"content-type": f"multipart/form-data; boundary={boundary}", **headers})
+                                 headers={"content-type": f"multipart/form-data; boundary={boundary}",
+                                          "user-agent": cantonese_ai_auth.USER_AGENT, **headers})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -366,7 +368,11 @@ def transcribe(audio, mimetype, tag=""):
     try:
         body = call()
     except urllib.error.HTTPError as e:
-        detail = f"stt {e.code}: {e.read()[:300]!r}"
+        raw = e.read()[:300]
+        detail = f"stt {e.code}: {raw!r}"
+        if e.code == 403 and b"error code:" in raw:
+            # Cloudflare refused the request before cantonese.ai saw it (not a key or plan problem).
+            detail += " (blocked by Cloudflare in front of cantonese.ai, not an API key problem)"
         if 400 <= e.code < 500 and e.code != 429:
             raise PermanentError(detail) from e
         raise TransientError(detail, e.headers.get("retry-after")) from e
@@ -476,7 +482,8 @@ def send_email(subject, text):
     body = {"personalizations": [{"to": [{"email": ALERT_EMAIL_TO}]}], "from": {"email": ALERT_EMAIL_FROM},
             "subject": subject, "content": [{"type": "text/plain", "value": text}]}
     req = urllib.request.Request(SENDGRID_URL, data=json.dumps(body).encode(), method="POST",
-                                 headers={"authorization": f"Bearer {SENDGRID_API_KEY}", "content-type": "application/json"})
+                                 headers={"authorization": f"Bearer {SENDGRID_API_KEY}", "content-type": "application/json",
+                                          "user-agent": cantonese_ai_auth.USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=REPLY_TIMEOUT_S) as r:
             r.read()
