@@ -67,11 +67,14 @@ class FakeBackends:
         self.chat_messages, self.fetch_status = [], 200
         self.after_stt = None  # hook run after each STT call (e.g. someone else replies)
         self.emails, self.mail_plan = [], []
+        self.user_agents = []  # (path, User-Agent) of every request
         backends = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["content-length"]))
+                with backends.lock:
+                    backends.user_agents.append((self.path, self.headers.get("user-agent")))
                 if self.path == "/api/stt":
                     return backends.stt(self, body)
                 if self.path.startswith("/client/sendMessage/"):
@@ -296,6 +299,32 @@ class TestTranscribe(AppUnitTest):
         self.assertEqual(self.app.transcribe(b"AUDIO-9", "audio/ogg"), "")
         self.fake.stt_plan["9"] = [{"body": {"success": True}}]
         self.assertEqual(self.app.transcribe(b"AUDIO-9", "audio/ogg"), "")
+
+
+class TestUserAgent(AppUnitTest):
+    # Cloudflare in front of cantonese.ai answers "Python-urllib/3.x" with 403 error code 1010.
+
+    def test_every_request_names_the_agent(self):
+        self.app.transcribe(b"AUDIO-1", "audio/ogg")
+        self.app.send_reply("keith", "c@c.us", "mid", "x")
+        self.app.send_email("subject", "text")
+        paths = sorted(path for path, _ in self.fake.user_agents)
+        self.assertEqual(paths, ["/api/stt", "/client/sendMessage/keith", "/v3/mail/send"])
+        for path, user_agent in self.fake.user_agents:
+            self.assertEqual(user_agent, self.app.cantonese_ai_auth.USER_AGENT, path)
+            self.assertNotIn("Python-urllib", user_agent, path)
+
+    def test_cloudflare_block_is_named(self):
+        self.fake.stt_plan["2"] = [{"code": 403, "raw": b"error code: 1010"}]
+        with self.assertRaises(self.app.PermanentError) as ctx:
+            self.app.transcribe(b"AUDIO-2", "audio/ogg")
+        self.assertIn("Cloudflare", str(ctx.exception))
+
+    def test_ordinary_403_is_not_blamed_on_cloudflare(self):
+        self.fake.stt_plan["3"] = [{"code": 403}]
+        with self.assertRaises(self.app.PermanentError) as ctx:
+            self.app.transcribe(b"AUDIO-3", "audio/ogg")
+        self.assertNotIn("Cloudflare", str(ctx.exception))
 
 
 class TestSendReply(AppUnitTest):

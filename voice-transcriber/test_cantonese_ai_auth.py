@@ -53,9 +53,17 @@ class FakeAuthServer:
         self.counter = 0
         self.expires_in = 3600
         self.reject_all_stt = False
+        self.user_agents = []  # (method, path, User-Agent) of every request
         srv = self
 
         class Handler(BaseHTTPRequestHandler):
+            def parse_request(self):
+                ok = super().parse_request()
+                if ok:
+                    with srv.lock:
+                        srv.user_agents.append((self.command, self.path, self.headers.get("user-agent")))
+                return ok
+
             def do_GET(self):
                 if self.path == "/.well-known/oauth-authorization-server" and srv.metadata:
                     return self.respond(200, {"issuer": srv.url, "authorization_endpoint": srv.url + "/custom/authorize",
@@ -245,6 +253,21 @@ class TestLogin(AuthTestCase):
             self.assertNotIn(secret, out.getvalue())  # never printed
         with open(self.path) as f:
             self.assertNotIn(CLIENT_SECRET, f.read())  # the token file never holds the client secret
+
+    def test_sign_in_and_refresh_name_the_agent(self):
+        # Cloudflare in front of cantonese.ai answers "Python-urllib/3.x" with 403 error code 1010.
+        out = io.StringIO()
+        self.login(listen=False, input_fn=self.paste_approver(out), out=out)
+        store = auth.TokenStore(self.path)
+        saved = store.load()
+        saved["expires_at"] = time.time() + 30  # inside the refresh margin
+        store.save(saved)
+        self.make_auth().authorization_header()  # refreshes
+        seen = [(method, path) for method, path, _ in self.fake.user_agents]
+        self.assertIn(("GET", "/.well-known/oauth-authorization-server"), seen)
+        self.assertEqual(seen.count(("POST", "/custom/token")), 2)  # code exchange + refresh
+        for method, path, user_agent in self.fake.user_agents:
+            self.assertEqual(user_agent, auth.USER_AGENT, f"{method} {path}")
 
     def test_wrong_client_secret_is_invalid_client(self):
         out = io.StringIO()
