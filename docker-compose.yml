@@ -21,6 +21,11 @@ services:
     # Keep this tag in step with wwebjs-api/sessions.js (a patched copy of this version's file).
     image: avoylenko/wwebjs-api:v1.34.7-hotfix2
     restart: unless-stopped
+    # Explicit DNS: on hosts whose resolver containers cannot reach (systemd-resolved 127.0.0.53, VPNs) Chromium
+    # cannot resolve web.whatsapp.com and no QR code ever appears. Override in .env on networks that block public DNS.
+    dns:
+      - ${DNS_SERVER_1:-1.1.1.1}
+      - ${DNS_SERVER_2:-8.8.8.8}
     environment:
       PORT: "3000"
       API_KEY: ${WWEBJS_API_KEY:?set WWEBJS_API_KEY in .env (openssl rand -hex 32)}
@@ -59,6 +64,11 @@ services:
   voice-transcriber:
     image: python:3.12-slim
     restart: unless-stopped
+    # Explicit DNS: on hosts whose resolver containers cannot reach (systemd-resolved 127.0.0.53, VPNs) Chromium
+    # cannot resolve web.whatsapp.com and no QR code ever appears. Override in .env on networks that block public DNS.
+    dns:
+      - ${DNS_SERVER_1:-1.1.1.1}
+      - ${DNS_SERVER_2:-8.8.8.8}
     working_dir: /app
     command: ["python", "-u", "app.py"]
     # Every variable in .env (see .env.example) is passed through.

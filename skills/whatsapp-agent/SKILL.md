@@ -82,44 +82,40 @@ Check that the containers can resolve WhatsApp **before** pairing (no QR code ap
 docker compose exec -T wwebjs-api getent hosts web.whatsapp.com   # must print an address
 ```
 
-If it prints nothing, the host's DNS is not reachable from containers (typical with
-systemd-resolved's `127.0.0.53`, VPNs or firewalled networks). Fix it **for these two containers
-only** -- do not restart the Docker daemon or edit `/etc/docker/daemon.json` on a shared server:
-
-```bash
-cat > docker-compose.override.yml <<'YAML'
-services:
-  wwebjs-api:
-    dns: [1.1.1.1, 8.8.8.8]
-  voice-transcriber:
-    dns: [1.1.1.1, 8.8.8.8]
-YAML
-docker compose up -d --force-recreate
-docker compose exec -T wwebjs-api getent hosts web.whatsapp.com
-```
-
-Use the network's own resolvers instead of 1.1.1.1 / 8.8.8.8 if outbound DNS is blocked. Also check
-`docker compose exec -T voice-transcriber python -c "import socket; print(socket.gethostbyname('cantonese.ai'))"`.
+Both containers use the DNS servers in `.env` (`DNS_SERVER_1` / `DNS_SERVER_2`, public resolvers by
+default), so this normally works out of the box. If it prints nothing, outbound DNS is probably blocked:
+set the network's own resolvers in `.env`, run `docker compose up -d --force-recreate` and check again.
+Do not restart the Docker daemon or edit `/etc/docker/daemon.json` on a shared server.
 A session started while DNS was broken can stay stuck: `GET /session/terminate/<id>`, then pair again.
 
-## 5. Link the phone
+## 5. Link the phone (pairing code -- ask for the user's phone number)
 
-Choose a session id (letters, digits, hyphens), e.g. `demo`.
+Link with a **pairing code**, not a QR code: the user usually talks to you from the same phone they are
+linking, so they cannot scan a code shown on that screen.
 
-```bash
-skills/whatsapp-agent/scripts/pair.sh demo                 # saves qr-demo.png; scan it
-skills/whatsapp-agent/scripts/pair.sh demo 85200000000     # or: pairing code for this number
-```
+1. **Ask the user for their WhatsApp phone number** with country code (e.g. Hong Kong `+852 xxxx xxxx`).
+   Normalise it to digits only, no `+`, spaces or leading zeros: `85200000000`. Use it only for pairing;
+   don't store it anywhere else.
+2. Pick a session id (letters, digits, hyphens), e.g. `demo`, and request the code:
+   ```bash
+   skills/whatsapp-agent/scripts/pair.sh demo 85200000000    # prints an 8-character code, e.g. ABCD-EFGH
+   ```
+3. **Send the user the code with these steps:** open WhatsApp on that phone > Settings (or the
+   three-dot menu) > Linked devices > Link a device > **Link with phone number instead** > enter the
+   8-character code. WhatsApp also shows a notification on the phone. The code expires after a few
+   minutes; if it does, request a new one (step 2).
+4. Wait until `GET /session/status/demo` reports connected (`pair.sh` polls it), then tell the user it
+   is linked.
 
-On the phone: WhatsApp > Settings > Linked devices > Link a device. Scan the QR code, or choose
-"Link with phone number instead" and type the 8-character code. The raw endpoints (all need the
-`x-api-key: $WWEBJS_API_KEY` header, on `http://127.0.0.1:3000`):
+Only if pairing codes fail repeatedly, fall back to a QR code (`pair.sh demo` without a number saves
+`qr-demo.png`) and ask the user to scan it from **another** device's screen.
+
+Raw endpoints (all need the `x-api-key: $WWEBJS_API_KEY` header, on `http://127.0.0.1:3000`):
 
 - `GET /session/start/<id>`, `GET /session/status/<id>`, `GET /session/getSessions`
-- `GET /session/qr/<id>/image` (PNG) or `GET /session/qr/<id>` (text)
-- `POST /session/requestPairingCode/<id>` with `{"phoneNumber": "85200000000"}`
+- `POST /session/requestPairingCode/<id>` with `{"phoneNumber": "85200000000", "showNotification": true}`
+- `GET /session/qr/<id>/image` (PNG) or `GET /session/qr/<id>` (text) -- fallback only
 - `GET /session/terminate/<id>` unlinks and deletes the session
-- A browser dashboard is at `http://127.0.0.1:3000/dashboard` (paste the key in its header box).
 
 The session survives restarts (`wwebjs-sessions` volume). Several numbers can be linked, one session each.
 

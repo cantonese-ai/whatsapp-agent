@@ -108,10 +108,21 @@ re-queue anything that ended up failed (see Operating).
 
 ## Linking a phone
 
-If no QR code ever appears, first check DNS inside the containers:
-`docker compose exec -T wwebjs-api getent hosts web.whatsapp.com`. If that prints nothing, add a
-`docker-compose.override.yml` with `dns: [1.1.1.1, 8.8.8.8]` for both services and run
-`docker compose up -d --force-recreate` (details in `skills/whatsapp-agent/SKILL.md`).
+If no QR code ever appears, check DNS inside the containers:
+`docker compose exec -T wwebjs-api getent hosts web.whatsapp.com`. Both containers use the resolvers in
+`DNS_SERVER_1` / `DNS_SERVER_2` (public by default); on networks that block public DNS set your own and
+run `docker compose up -d --force-recreate`.
+
+Link with a **pairing code** for the user's phone number (the setup agent asks the user for it);
+no QR code needs scanning:
+
+```bash
+skills/whatsapp-agent/scripts/pair.sh demo 85200000000   # number with country code, digits only
+```
+
+It prints an 8-character code. On the phone: WhatsApp > Settings > Linked devices > Link a device >
+**Link with phone number instead** > enter the code (it expires after a few minutes; request a new one if
+needed). A QR code (`pair.sh demo` without a number) is only a fallback, scanned from another screen.
 
 All wwebjs-api endpoints need the header `x-api-key: <WWEBJS_API_KEY>` and are on
 `http://127.0.0.1:3000` (paths checked against wwebjs-api v1.34.7-hotfix2):
@@ -119,15 +130,13 @@ All wwebjs-api endpoints need the header `x-api-key: <WWEBJS_API_KEY>` and are o
 | Step | Request |
 | --- | --- |
 | Start a session | `GET /session/start/<id>` (id: letters, digits, hyphens) |
-| QR code | `GET /session/qr/<id>/image` (PNG), or `GET /session/qr/<id>` |
-| Or a pairing code | `POST /session/requestPairingCode/<id>` with `{"phoneNumber": "85200000000"}` |
+| Pairing code | `POST /session/requestPairingCode/<id>` with `{"phoneNumber": "85200000000", "showNotification": true}` |
 | State | `GET /session/status/<id>`, `GET /session/getSessions` |
+| QR code (fallback) | `GET /session/qr/<id>/image` (PNG), or `GET /session/qr/<id>` |
 | Unlink and delete | `GET /session/terminate/<id>` |
 
-Then on the phone: WhatsApp > Settings > Linked devices > Link a device (scan the QR code, or
-"Link with phone number instead" and enter the code). The web dashboard at
-`http://127.0.0.1:3000/dashboard` does the same in a browser; Swagger UI is at `/api-docs`.
-`skills/whatsapp-agent/scripts/pair.sh <id> [phone]` wraps these steps.
+The web dashboard at `http://127.0.0.1:3000/dashboard` does the same in a browser; Swagger UI is at
+`/api-docs`.
 
 Each session runs its own Chromium (about 300–500 MB). By default every session posts to
 `BASE_WEBHOOK_URL` (the transcriber). To send one session's events elsewhere, set

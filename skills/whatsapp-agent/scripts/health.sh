@@ -19,7 +19,7 @@ print()' || ok=1
 printf 'DNS (inside containers): '
 (cd "$REPO_ROOT" && docker compose exec -T wwebjs-api getent hosts web.whatsapp.com >/dev/null 2>&1 \
   && docker compose exec -T voice-transcriber python -c "import socket; socket.gethostbyname('cantonese.ai')" >/dev/null 2>&1 \
-  && echo ok) || { echo "FAILED -- see 'DNS' in skills/whatsapp-agent/SKILL.md (docker-compose.override.yml with dns:)"; ok=1; }
+  && echo ok) || { echo "FAILED -- set DNS_SERVER_1/2 in .env, see skills/whatsapp-agent/SKILL.md"; ok=1; }
 printf 'cantonese.ai credential: '
 (cd "$REPO_ROOT" && docker compose exec -T voice-transcriber python app.py auth-status 2>/dev/null) || echo "(docker compose not available here)"
 exit $ok

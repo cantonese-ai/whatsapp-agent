@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Link a WhatsApp number to the agent.
-#   pair.sh <session-id>                      start the session and save the QR code to qr-<session-id>.png
-#   pair.sh <session-id> <phone-number>       get an 8-character pairing code instead (international
-#                                             format, digits only, e.g. 85200000000)
-# Then on the phone: WhatsApp > Settings > Linked devices > Link a device (scan the QR, or choose
-# "Link with phone number instead" and type the code).
+#   pair.sh <session-id> <phone-number>       DEFAULT: 8-character pairing code for that number (with country
+#                                             code; "+852 0000 0000" or 85200000000 both work)
+#   pair.sh <session-id>                      fallback: save a QR code to qr-<session-id>.png
+# Then on the phone: WhatsApp > Settings > Linked devices > Link a device > "Link with phone number
+# instead" > type the code (or scan the QR from another screen).
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 SESSION="${1:?usage: pair.sh <session-id> [phone-number]}"
-PHONE="${2:-}"
+PHONE="$(printf '%s' "${2:-}" | tr -cd '0-9' | sed 's/^00//')"   # keep digits; drop an 00 international prefix
 case "$SESSION" in *[!A-Za-z0-9-]*) echo "session id: letters, digits and hyphens only" >&2; exit 1;; esac
 
 echo "Starting session '$SESSION'..."
