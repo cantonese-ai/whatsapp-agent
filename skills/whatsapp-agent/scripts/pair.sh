@@ -16,10 +16,19 @@ api "$WWEBJS/session/start/$SESSION"; echo
 sleep 5
 
 if [ -n "$PHONE" ]; then
-  echo "Requesting a pairing code for +$PHONE..."
-  api -X POST -H 'content-type: application/json' \
+  echo "Requesting a pairing code for +$PHONE..." >&2
+  REPLY="$(api -X POST -H 'content-type: application/json' \
     -d "{\"phoneNumber\": \"$PHONE\", \"showNotification\": true}" \
-    "$WWEBJS/session/requestPairingCode/$SESSION"; echo
+    "$WWEBJS/session/requestPairingCode/$SESSION")"
+  CODE="$(printf '%s' "$REPLY" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except ValueError: d={}
+c=d.get("result") or d.get("code") or d.get("pairingCode") or ""
+print(c if isinstance(c,str) else "")')"
+  if [ -z "$CODE" ]; then echo "No pairing code in the reply: $REPLY" >&2; exit 1; fi
+  # The code alone on stdout (and on its own line): send it to the user as a message with nothing else in it.
+  echo "PAIRING CODE (send this line alone to the user):" >&2
+  echo "$CODE"
 else
   OUT="qr-$SESSION.png"
   for _ in $(seq 1 12); do

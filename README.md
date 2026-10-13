@@ -120,7 +120,9 @@ no QR code needs scanning:
 skills/whatsapp-agent/scripts/pair.sh demo 85200000000   # number with country code, digits only
 ```
 
-It prints an 8-character code. On the phone: WhatsApp > Settings > Linked devices > Link a device >
+It prints an 8-character code. A setup agent sends the user the code **as a message on its own, with
+nothing else in it** (e.g. just `ABCD-EFGH`), so it can be copied with one tap; the instructions go in a
+separate message. On the phone: WhatsApp > Settings > Linked devices > Link a device >
 **Link with phone number instead** > enter the code (it expires after a few minutes; request a new one if
 needed). A QR code (`pair.sh demo` without a number) is only a fallback, scanned from another screen.
 

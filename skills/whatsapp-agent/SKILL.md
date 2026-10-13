@@ -100,10 +100,12 @@ linking, so they cannot scan a code shown on that screen.
    ```bash
    skills/whatsapp-agent/scripts/pair.sh demo 85200000000    # prints an 8-character code, e.g. ABCD-EFGH
    ```
-3. **Send the user the code with these steps:** open WhatsApp on that phone > Settings (or the
-   three-dot menu) > Linked devices > Link a device > **Link with phone number instead** > enter the
-   8-character code. WhatsApp also shows a notification on the phone. The code expires after a few
-   minutes; if it does, request a new one (step 2).
+3. **Send the code as its own message, containing ONLY the code** -- no greeting, label, quotes,
+   formatting or punctuation (e.g. the whole message is `ABCD-EFGH`), so the user can long-press and copy
+   it in one go. Put the instructions in a separate message before it: open WhatsApp on that phone >
+   Settings (or the three-dot menu) > Linked devices > Link a device > **Link with phone number
+   instead** > enter the code. WhatsApp also shows a notification on the phone. The code expires after a
+   few minutes; if it does, request a new one (step 2) and again send it alone.
 4. Wait until `GET /session/status/demo` reports connected (`pair.sh` polls it), then tell the user it
    is linked.
 
