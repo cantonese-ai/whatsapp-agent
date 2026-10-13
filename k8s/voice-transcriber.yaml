@@ -1,0 +1,123 @@
+# Transcribes incoming WhatsApp voice notes with the cantonese.ai speech-to-text API and replies in
+# the same chat, quoting the voice note. wwebjs-api posts its "media" webhooks here.
+#
+# Secret (create it yourself, never commit it). WWEBJS_API_KEY must equal wwebjs-api's API_KEY;
+# CANTONESE_AI_API_KEY and SENDGRID_API_KEY are optional:
+#   kubectl -n whatsapp-agent create secret generic voice-transcriber \
+#     --from-literal=WWEBJS_API_KEY="<same value as the wwebjs-api secret>" \
+#     --from-literal=CANTONESE_AI_API_KEY="<sk-... from https://cantonese.ai/api-keys, or leave out>"
+# Without an API key, sign in once with your cantonese.ai account (token saved on the volume):
+#   kubectl -n whatsapp-agent exec -it deploy/voice-transcriber -- python /app/app.py login --no-browser
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: voice-transcriber-data
+  namespace: whatsapp-agent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-transcriber
+  namespace: whatsapp-agent
+  labels:
+    app: voice-transcriber
+spec:
+  replicas: 1
+  # The SQLite queue is on a ReadWriteOnce volume, which may not attach to two nodes at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: voice-transcriber
+  template:
+    metadata:
+      labels:
+        app: voice-transcriber
+    spec:
+      # Long enough for in-flight jobs to finish one STT attempt (150 s) and reply.
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: app
+          image: python:3.12-slim
+          command: ["python", "-u", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: WWEBJS_URL
+              value: "http://wwebjs-api:3000"
+            - name: STT_URL
+              value: "https://cantonese.ai/api/stt"
+            - name: STT_LANG
+              value: "cantonese"
+            - name: VOICE_TYPES
+              value: "ptt,audio"
+            - name: DB_PATH
+              value: "/data/queue.db"
+            - name: CANTONESE_AI_TOKEN_PATH
+              value: "/data/cantonese-ai-token.json"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: WWEBJS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: voice-transcriber
+                  key: WWEBJS_API_KEY
+            - name: CANTONESE_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: voice-transcriber
+                  key: CANTONESE_AI_API_KEY
+                  optional: true
+            # Optional alert e-mails: also set ALERT_EMAIL_TO and ALERT_EMAIL_FROM to enable.
+            - name: SENDGRID_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: voice-transcriber
+                  key: SENDGRID_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: data
+              mountPath: /data
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: app
+          configMap:
+            name: voice-transcriber
+        - name: data
+          persistentVolumeClaim:
+            claimName: voice-transcriber-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: voice-transcriber
+  namespace: whatsapp-agent
+spec:
+  selector:
+    app: voice-transcriber
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

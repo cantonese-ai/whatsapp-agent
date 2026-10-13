@@ -1,0 +1,18 @@
+# Optional Kubernetes deployment (docker-compose.yml is the primary way to run this).
+# The ConfigMaps are generated from files outside this directory, so kustomize needs its
+# load restrictor relaxed:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone k8s | kubectl apply -f -
+# Create the two Secrets first (see the comments at the top of each manifest).
+namespace: whatsapp-agent
+resources:
+  - namespace.yaml
+  - wwebjs-api.yaml
+  - voice-transcriber.yaml
+configMapGenerator:
+  - name: voice-transcriber
+    files:
+      - ../voice-transcriber/app.py
+      - ../voice-transcriber/cantonese_ai_auth.py
+  - name: wwebjs-api-patch
+    files:
+      - ../wwebjs-api/sessions.js

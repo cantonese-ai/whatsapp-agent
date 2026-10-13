@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+cantonese-ai-token.json
+__pycache__/
+*.pyc
+.DS_Store

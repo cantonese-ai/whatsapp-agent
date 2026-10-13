@@ -1,0 +1,81 @@
+# WhatsApp voice-note transcription agent: wwebjs-api (WhatsApp Web in headless Chromium)
+# + voice-transcriber (queues voice notes, transcribes them with cantonese.ai, replies).
+#
+#   cp .env.example .env    # then set WWEBJS_API_KEY (openssl rand -hex 32)
+#   docker compose run --rm voice-transcriber python app.py login   # or set CANTONESE_AI_API_KEY
+#   docker compose up -d
+#
+# Both ports are bound to 127.0.0.1 only: whoever reaches wwebjs-api can read and send
+# messages as your WhatsApp number. Do not publish them to the internet.
+name: whatsapp-agent
+
+services:
+  wwebjs-api:
+    # Keep this tag in step with wwebjs-api/sessions.js (a patched copy of this version's file).
+    image: avoylenko/wwebjs-api:v1.34.7-hotfix2
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      API_KEY: ${WWEBJS_API_KEY:?set WWEBJS_API_KEY in .env (openssl rand -hex 32)}
+      SESSIONS_PATH: /usr/src/app/sessions
+      ENABLE_WEB_UI: ${WWEBJS_ENABLE_WEB_UI:-TRUE}
+      ENABLE_SWAGGER_ENDPOINT: ${WWEBJS_ENABLE_SWAGGER:-TRUE}
+      # Voice notes go to voice-transcriber, which only needs "media" (plus the patch's
+      # session_paired / session_removed events, which are always sent).
+      ENABLE_WEBHOOK: "TRUE"
+      BASE_WEBHOOK_URL: http://voice-transcriber:8080/webhook
+      DISABLED_CALLBACKS: "auth_failure|authenticated|call|change_state|disconnected|group_join|group_leave|group_update|loading_screen|media_uploaded|message_ack|message_create|message_reaction|message_revoke_everyone|qr|ready|contact_changed|unread_count|message_edit|message_ciphertext"
+      ENABLE_LOCAL_CALLBACK_EXAMPLE: "FALSE"
+      ENABLE_WEBSOCKET: "FALSE"
+      # A personal number: do not mark incoming chats as read.
+      SET_MESSAGES_AS_SEEN: ${SET_MESSAGES_AS_SEEN:-FALSE}
+      AUTO_START_SESSIONS: "TRUE"
+      RECOVER_SESSIONS: "TRUE"
+      HEADLESS: "TRUE"
+      LOG_LEVEL: ${WWEBJS_LOG_LEVEL:-info}
+      # Catch-up after a restart re-sends voice notes at most this old.
+      CATCHUP_MAX_SECONDS: ${CATCHUP_MAX_SECONDS:-3600}
+    volumes:
+      - wwebjs-sessions:/usr/src/app/sessions
+      - ./wwebjs-api/sessions.js:/usr/src/app/src/sessions.js:ro
+    # Chromium crashes with Docker's default 64 MB /dev/shm.
+    shm_size: 512mb
+    ports:
+      - "127.0.0.1:${WWEBJS_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/ping', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  voice-transcriber:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    # Every variable in .env (see .env.example) is passed through.
+    env_file: .env
+    environment:
+      WWEBJS_URL: http://wwebjs-api:3000
+      DB_PATH: /data/queue.db
+      CANTONESE_AI_TOKEN_PATH: /data/cantonese-ai-token.json
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./voice-transcriber:/app:ro
+      - transcriber-data:/data
+    ports:
+      - "127.0.0.1:${TRANSCRIBER_PORT:-8080}:8080"
+    # Lets in-flight jobs finish one STT attempt (150 s) and reply after `docker compose stop`.
+    stop_grace_period: 300s
+    depends_on:
+      - wwebjs-api
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  wwebjs-sessions:   # the WhatsApp linked-device login: treat like a password
+  transcriber-data:  # SQLite queue + cantonese.ai sign-in token

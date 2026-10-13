@@ -1,0 +1,134 @@
+# wwebjs-api (https://github.com/avoylenko/wwebjs-api): WhatsApp Web in headless Chromium, REST API.
+#
+# Secret (create it yourself, never commit it):
+#   kubectl -n whatsapp-agent create secret generic wwebjs-api --from-literal=API_KEY="$(openssl rand -hex 32)"
+#
+# No Service of type LoadBalancer / NodePort and no Ingress on purpose: whoever reaches this API
+# can read and send messages as the linked number. Reach it with
+#   kubectl -n whatsapp-agent port-forward svc/wwebjs-api 3000:3000
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wwebjs-sessions
+  namespace: whatsapp-agent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wwebjs-api
+  namespace: whatsapp-agent
+  labels:
+    app: wwebjs-api
+spec:
+  replicas: 1
+  # Two Chromium instances on one session directory corrupt the login: never overlap.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wwebjs-api
+  template:
+    metadata:
+      labels:
+        app: wwebjs-api
+    spec:
+      containers:
+        - name: api
+          image: avoylenko/wwebjs-api:v1.34.7-hotfix2
+          ports:
+            - containerPort: 3000
+              name: http
+          env:
+            - name: PORT
+              value: "3000"
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wwebjs-api
+                  key: API_KEY
+            - name: ENABLE_WEB_UI
+              value: "TRUE"
+            - name: ENABLE_SWAGGER_ENDPOINT
+              value: "TRUE"
+            - name: ENABLE_WEBHOOK
+              value: "TRUE"
+            - name: BASE_WEBHOOK_URL
+              value: "http://voice-transcriber:8080/webhook"
+            - name: DISABLED_CALLBACKS
+              value: "auth_failure|authenticated|call|change_state|disconnected|group_join|group_leave|group_update|loading_screen|media_uploaded|message_ack|message_create|message_reaction|message_revoke_everyone|qr|ready|contact_changed|unread_count|message_edit|message_ciphertext"
+            - name: ENABLE_LOCAL_CALLBACK_EXAMPLE
+              value: "FALSE"
+            - name: ENABLE_WEBSOCKET
+              value: "FALSE"
+            - name: SET_MESSAGES_AS_SEEN
+              value: "FALSE"
+            - name: AUTO_START_SESSIONS
+              value: "TRUE"
+            - name: RECOVER_SESSIONS
+              value: "TRUE"
+            - name: HEADLESS
+              value: "TRUE"
+            - name: SESSIONS_PATH
+              value: "/usr/src/app/sessions"
+            - name: CATCHUP_MAX_SECONDS
+              value: "3600"
+            - name: LOG_LEVEL
+              value: "info"
+          volumeMounts:
+            - name: sessions
+              mountPath: /usr/src/app/sessions
+            - name: dshm
+              mountPath: /dev/shm
+            # Patched src/sessions.js (see wwebjs-api/sessions.js).
+            - name: patch
+              mountPath: /usr/src/app/src/sessions.js
+              subPath: sessions.js
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          # Each linked number (session) runs its own headless Chromium, roughly 300-500 MiB.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+      volumes:
+        - name: sessions
+          persistentVolumeClaim:
+            claimName: wwebjs-sessions
+        # Chromium crashes with the default 64 MiB /dev/shm.
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+        - name: patch
+          configMap:
+            name: wwebjs-api-patch
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wwebjs-api
+  namespace: whatsapp-agent
+spec:
+  selector:
+    app: wwebjs-api
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
