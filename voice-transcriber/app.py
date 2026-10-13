@@ -2,7 +2,10 @@
 speech-to-text API and reply in the same chat, quoting the voice note.
 
   python app.py                      run the service (webhook + admin API on PORT, default 8080)
-  python app.py login [--no-browser] sign in with your cantonese.ai account (OAuth 2.0 + PKCE)
+  python app.py login [--no-browser] [--no-listen]
+                                     sign in with your cantonese.ai account (OAuth 2.0; needs
+                                     CANTONESE_AI_OAUTH_CLIENT_SECRET). --no-browser: only print the
+                                     URL; --no-listen: no callback listener, paste the redirected URL
   python app.py logout               forget the saved sign-in
   python app.py auth-status          which cantonese.ai credential is in use (never prints it)
 
@@ -63,6 +66,14 @@ CANTONESE_AI_API_KEY = os.environ.get("CANTONESE_AI_API_KEY", "")
 CANTONESE_AI_ISSUER = os.environ.get("CANTONESE_AI_ISSUER", cantonese_ai_auth.DEFAULT_ISSUER)
 CANTONESE_AI_OAUTH_CLIENT_ID = os.environ.get("CANTONESE_AI_OAUTH_CLIENT_ID", cantonese_ai_auth.DEFAULT_CLIENT_ID)
 CANTONESE_AI_OAUTH_SCOPE = os.environ.get("CANTONESE_AI_OAUTH_SCOPE", cantonese_ai_auth.DEFAULT_SCOPE)
+# Given to each install by the setup bot / the owner; never commit it. Needed for login and refresh.
+CANTONESE_AI_OAUTH_CLIENT_SECRET = os.environ.get("CANTONESE_AI_OAUTH_CLIENT_SECRET", "")
+# The registered redirect URI is exactly http://127.0.0.1:53682/callback.
+CANTONESE_AI_OAUTH_CALLBACK_PORT = int(os.environ.get("CANTONESE_AI_OAUTH_CALLBACK_PORT")
+                                       or cantonese_ai_auth.DEFAULT_CALLBACK_PORT)
+# 127.0.0.1, or 0.0.0.0 inside a container whose port 53682 is published to the host's 127.0.0.1.
+CANTONESE_AI_OAUTH_CALLBACK_BIND = (os.environ.get("CANTONESE_AI_OAUTH_CALLBACK_BIND")
+                                    or cantonese_ai_auth.DEFAULT_CALLBACK_BIND)
 STT_LANG = os.environ.get("STT_LANG", "cantonese")
 VOICE_TYPES = set(os.environ.get("VOICE_TYPES", "ptt,audio").split(","))
 REPLY_PREFIX = os.environ.get("REPLY_PREFIX", "📝 ")
@@ -309,7 +320,8 @@ def stt_auth():
         if _auth is None:
             _auth = cantonese_ai_auth.CantoneseAiAuth(
                 api_key=CANTONESE_AI_API_KEY, token_path=CANTONESE_AI_TOKEN_PATH,
-                client_id=CANTONESE_AI_OAUTH_CLIENT_ID, issuer=CANTONESE_AI_ISSUER)
+                client_id=CANTONESE_AI_OAUTH_CLIENT_ID, issuer=CANTONESE_AI_ISSUER,
+                client_secret=CANTONESE_AI_OAUTH_CLIENT_SECRET)
         return _auth
 
 
@@ -734,10 +746,13 @@ def cli(argv):
     cmd = argv[0] if argv else "serve"
     if cmd == "login":
         no_browser = "--no-browser" in argv[1:]
+        no_listen = "--no-listen" in argv[1:]
         try:
             cantonese_ai_auth.login(token_path=CANTONESE_AI_TOKEN_PATH, client_id=CANTONESE_AI_OAUTH_CLIENT_ID,
                                     issuer=CANTONESE_AI_ISSUER, scope=CANTONESE_AI_OAUTH_SCOPE,
-                                    open_browser=not no_browser, listen=not no_browser)
+                                    client_secret=CANTONESE_AI_OAUTH_CLIENT_SECRET,
+                                    port=CANTONESE_AI_OAUTH_CALLBACK_PORT, bind=CANTONESE_AI_OAUTH_CALLBACK_BIND,
+                                    open_browser=not no_browser, listen=not no_listen)
         except cantonese_ai_auth.AuthError as e:
             print(f"Sign-in failed: {e}", file=sys.stderr)
             return 1
@@ -749,7 +764,8 @@ def cli(argv):
         print("Signed out." if removed else "Was not signed in.")
         return 0
     if cmd in ("auth-status", "whoami"):
-        print(cantonese_ai_auth.status(CANTONESE_AI_TOKEN_PATH, CANTONESE_AI_API_KEY))
+        print(cantonese_ai_auth.status(CANTONESE_AI_TOKEN_PATH, CANTONESE_AI_API_KEY,
+                                       client_secret=CANTONESE_AI_OAUTH_CLIENT_SECRET))
         return 0
     if cmd != "serve":
         print(__doc__, file=sys.stderr)
@@ -762,7 +778,8 @@ def serve():
     if not WWEBJS_API_KEY:
         log.error("WWEBJS_API_KEY is not set (generate one with `openssl rand -hex 32`); refusing to start")
         sys.exit(1)
-    log.info("cantonese.ai credential: %s", cantonese_ai_auth.status(CANTONESE_AI_TOKEN_PATH, CANTONESE_AI_API_KEY))
+    log.info("cantonese.ai credential: %s", cantonese_ai_auth.status(CANTONESE_AI_TOKEN_PATH, CANTONESE_AI_API_KEY,
+                                                                    client_secret=CANTONESE_AI_OAUTH_CLIENT_SECRET))
     if not alerts_enabled():
         log.info("alert e-mails off (set SENDGRID_API_KEY, ALERT_EMAIL_TO and ALERT_EMAIL_FROM to enable)")
     signal.signal(signal.SIGTERM, on_sigterm)

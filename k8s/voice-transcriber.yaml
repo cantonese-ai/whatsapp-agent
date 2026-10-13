@@ -1,13 +1,22 @@
 # Transcribes incoming WhatsApp voice notes with the cantonese.ai speech-to-text API and replies in
 # the same chat, quoting the voice note. wwebjs-api posts its "media" webhooks here.
 #
-# Secret (create it yourself, never commit it). WWEBJS_API_KEY must equal wwebjs-api's API_KEY;
+# Secrets (create them yourself, never commit them). WWEBJS_API_KEY must equal wwebjs-api's API_KEY;
 # CANTONESE_AI_API_KEY and SENDGRID_API_KEY are optional:
 #   kubectl -n whatsapp-agent create secret generic voice-transcriber \
 #     --from-literal=WWEBJS_API_KEY="<same value as the wwebjs-api secret>" \
 #     --from-literal=CANTONESE_AI_API_KEY="<sk-... from https://cantonese.ai/api-keys, or leave out>"
-# Without an API key, sign in once with your cantonese.ai account (token saved on the volume):
+# "Sign in with cantonese.ai" client (the secret is provided by cantonese.ai / the setup bot; the
+# Secret is optional so API-key mode works without it):
+#   kubectl -n whatsapp-agent create secret generic whatsapp-agent-oauth-client \
+#     --from-literal=CANTONESE_AI_OAUTH_CLIENT_ID=whatsapp-agent \
+#     --from-literal=CANTONESE_AI_OAUTH_CLIENT_SECRET="<client secret>"
+# Then sign in once with your cantonese.ai account (token saved on the volume). Open the printed
+# URL; when the browser lands on http://127.0.0.1:53682/callback?... (which will not load), paste
+# that address into the terminal:
 #   kubectl -n whatsapp-agent exec -it deploy/voice-transcriber -- python /app/app.py login --no-browser
+# (Or keep `kubectl -n whatsapp-agent port-forward deploy/voice-transcriber 53682:53682` running
+# on the machine with the browser, and the redirect reaches the login's listener directly.)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -73,6 +82,19 @@ spec:
                 secretKeyRef:
                   name: voice-transcriber
                   key: CANTONESE_AI_API_KEY
+                  optional: true
+            # "Sign in with cantonese.ai" client; optional so API-key mode works without it.
+            - name: CANTONESE_AI_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-agent-oauth-client
+                  key: CANTONESE_AI_OAUTH_CLIENT_ID
+                  optional: true
+            - name: CANTONESE_AI_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: whatsapp-agent-oauth-client
+                  key: CANTONESE_AI_OAUTH_CLIENT_SECRET
                   optional: true
             # Optional alert e-mails: also set ALERT_EMAIL_TO and ALERT_EMAIL_FROM to enable.
             - name: SENDGRID_API_KEY

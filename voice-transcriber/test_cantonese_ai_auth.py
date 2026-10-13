@@ -2,8 +2,9 @@
 
     cd voice-transcriber && python3 -m unittest -v test_cantonese_ai_auth
 
-A fake authorization server (metadata, token endpoint with PKCE checks and refresh-token
-rotation) and a fake /api/stt that only accepts the current access token.
+A fake authorization server (optional metadata, token endpoint that requires the client
+secret on every grant, checks PKCE and rotates refresh tokens) and a fake /api/stt that only
+accepts the current access token.
 """
 import base64
 import hashlib
@@ -12,6 +13,8 @@ import io
 import json
 import logging
 import os
+import queue
+import socket
 import stat
 import sys
 import tempfile
@@ -30,6 +33,13 @@ for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy"
     os.environ.pop(_k, None)
 
 CLIENT_ID = "whatsapp-agent"
+CLIENT_SECRET = "test-client-secret-not-real"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 logging.getLogger("cantonese-ai-auth").setLevel(logging.CRITICAL)
 
 
@@ -89,8 +99,8 @@ class FakeAuthServer:
     def token(self, h, form):
         with self.lock:
             self.token_requests.append(form)
-        if "client_secret" in form or form.get("client_id") != CLIENT_ID:
-            return h.respond(401, {"error": "invalid_client"})
+        if form.get("client_id") != CLIENT_ID or form.get("client_secret") != CLIENT_SECRET:
+            return h.respond(401, {"error": "invalid_client", "error_description": "client authentication failed"})
         if form.get("grant_type") == "authorization_code":
             entry = self.codes.pop(form.get("code"), None)
             verifier = form.get("code_verifier", "")
@@ -138,7 +148,14 @@ class AuthTestCase(unittest.TestCase):
         self.path = os.path.join(self.tmp, "data", "cantonese-ai-token.json")
 
     def make_auth(self, **kw):
+        kw.setdefault("client_secret", CLIENT_SECRET)
         return auth.CantoneseAiAuth(token_path=self.path, client_id=CLIENT_ID, issuer=self.fake.url, **kw)
+
+    def login(self, **kw):
+        kw.setdefault("client_secret", CLIENT_SECRET)
+        kw.setdefault("open_browser", False)
+        kw.setdefault("timeout_s", 10)
+        return auth.login(token_path=self.path, client_id=CLIENT_ID, issuer=self.fake.url, **kw)
 
 
 class TestPkceAndUrls(AuthTestCase):
@@ -197,29 +214,65 @@ class TestStateCheck(unittest.TestCase):
 
 
 class TestLogin(AuthTestCase):
-    def test_paste_flow_saves_tokens_without_client_secret(self):
-        out = io.StringIO()
-
+    def paste_approver(self, out):
         def paste(prompt):
             url = out.getvalue().split("\n\n  ")[1].split("\n")[0]
             return self.fake.approve(url)
-        saved = auth.login(token_path=self.path, client_id=CLIENT_ID, issuer=self.fake.url, open_browser=False,
-                           listen=False, input_fn=paste, out=out, timeout_s=10)
+        return paste
+
+    def test_fixed_redirect_uri(self):
+        self.assertEqual(auth.DEFAULT_CALLBACK_PORT, 53682)
+        self.assertEqual(auth.redirect_uri_for(), "http://127.0.0.1:53682/callback")
+        out = io.StringIO()
+        self.login(listen=False, input_fn=self.paste_approver(out), out=out)  # default port
+        [req] = self.fake.token_requests
+        self.assertEqual(req["redirect_uri"], "http://127.0.0.1:53682/callback")
+        authorize = out.getvalue().split("\n\n  ")[1].split("\n")[0]
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(authorize).query))
+        self.assertEqual(q["redirect_uri"], "http://127.0.0.1:53682/callback")
+        self.assertNotIn("client_secret", authorize)  # never in the browser URL
+
+    def test_paste_flow_sends_client_secret(self):
+        out = io.StringIO()
+        saved = self.login(listen=False, input_fn=self.paste_approver(out), out=out)
         self.assertEqual((saved["access_token"], saved["refresh_token"]), ("at-1", "rt-1"))
         self.assertEqual(auth.TokenStore(self.path).load()["access_token"], "at-1")
         [req] = self.fake.token_requests
         self.assertEqual(req["grant_type"], "authorization_code")
-        self.assertNotIn("client_secret", req)
-        self.assertTrue(req["redirect_uri"].startswith("http://127.0.0.1:") and req["redirect_uri"].endswith("/callback"))
-        self.assertNotIn("at-1", out.getvalue())  # tokens are never printed
+        self.assertEqual((req["client_id"], req["client_secret"]), (CLIENT_ID, CLIENT_SECRET))
+        self.assertTrue(req["code_verifier"])  # PKCE still sent
+        for secret in ("at-1", "rt-1", CLIENT_SECRET):
+            self.assertNotIn(secret, out.getvalue())  # never printed
+        with open(self.path) as f:
+            self.assertNotIn(CLIENT_SECRET, f.read())  # the token file never holds the client secret
+
+    def test_wrong_client_secret_is_invalid_client(self):
+        out = io.StringIO()
+        with self.assertRaises(auth.AuthError) as ctx:
+            self.login(listen=False, input_fn=self.paste_approver(out), out=out, client_secret="wrong-secret")
+        self.assertEqual(ctx.exception.status, 401)
+        self.assertIn("invalid_client", str(ctx.exception))
+        self.assertNotIn("wrong-secret", str(ctx.exception) + out.getvalue())
+        self.assertIsNone(auth.TokenStore(self.path).load())
+
+    def test_missing_client_secret_fails_before_sign_in(self):
+        for secret in (None, "", "   "):
+            out = io.StringIO()
+            with self.assertRaises(auth.MissingClientSecret) as ctx:
+                self.login(listen=False, input_fn=lambda p: self.fail("asked for input"), out=out,
+                           client_secret=secret)
+            self.assertIn("CANTONESE_AI_OAUTH_CLIENT_SECRET", str(ctx.exception))
+            self.assertIn("setup bot", str(ctx.exception))
+            self.assertEqual(out.getvalue(), "")
+        self.assertEqual(self.fake.token_requests, [])
 
     def test_loopback_listener_flow(self):
         out = io.StringIO()
         result = {}
+        port = free_port()
 
         def run():
-            result["tokens"] = auth.login(token_path=self.path, client_id=CLIENT_ID, issuer=self.fake.url,
-                                          open_browser=False, listen=True, input_fn=None, out=out, timeout_s=10)
+            result["tokens"] = self.login(listen=True, input_fn=None, out=out, port=port)
         t = threading.Thread(target=run)
         t.start()
         deadline = time.time() + 5
@@ -227,28 +280,44 @@ class TestLogin(AuthTestCase):
             time.sleep(0.02)
         url = out.getvalue().split("\n\n  ")[1].split("\n")[0]
         redirect = self.fake.approve(url)
-        self.assertTrue(redirect.startswith("http://127.0.0.1:"))
+        self.assertTrue(redirect.startswith(f"http://127.0.0.1:{port}/callback?"))
         with urllib.request.urlopen(redirect, timeout=5) as r:
             self.assertEqual(r.status, 200)
         t.join(10)
         self.assertEqual(result["tokens"]["access_token"], "at-1")
 
-    def test_listener_binds_loopback_only(self):
-        results = __import__("queue").Queue()
-        port = auth._free_loopback_port()
-        server = auth._start_callback_listener(port, results)
+    def test_listener_binds_loopback_by_default(self):
+        server = auth._start_callback_listener(free_port(), queue.Queue())
         try:
             self.assertEqual(server.server_address[0], "127.0.0.1")
         finally:
             server.shutdown()
             server.server_close()
 
+    def test_listener_bind_option_for_containers(self):
+        server = auth._start_callback_listener(free_port(), queue.Queue(), bind="0.0.0.0")
+        try:
+            self.assertEqual(server.server_address[0], "0.0.0.0")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_busy_port_fails_clearly(self):
+        with socket.socket() as blocker:
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            port = blocker.getsockname()[1]
+            with self.assertRaises(auth.AuthError) as ctx:
+                self.login(listen=True, input_fn=None, out=io.StringIO(), port=port)
+        self.assertIn(str(port), str(ctx.exception))
+        self.assertIn("cannot change", str(ctx.exception))
+        self.assertEqual(self.fake.token_requests, [])
+
     def test_forged_state_aborts_login(self):
         def paste(prompt):
             return "http://127.0.0.1:9/callback?code=stolen&state=forged"
         with self.assertRaises(auth.StateMismatch):
-            auth.login(token_path=self.path, client_id=CLIENT_ID, issuer=self.fake.url, open_browser=False,
-                       listen=False, input_fn=paste, out=io.StringIO(), timeout_s=5)
+            self.login(listen=False, input_fn=paste, out=io.StringIO(), timeout_s=5)
         self.assertEqual(self.fake.token_requests, [])
         self.assertIsNone(auth.TokenStore(self.path).load())
 
@@ -259,7 +328,8 @@ class TestLogin(AuthTestCase):
         with self.assertRaises(auth.AuthError) as ctx:
             auth._token_request(self.fake.url + "/api/oauth/token", {
                 "grant_type": "authorization_code", "code": code, "client_id": CLIENT_ID,
-                "redirect_uri": "http://127.0.0.1:1/callback", "code_verifier": "an-attacker-guess-" + "b" * 30})
+                "client_secret": CLIENT_SECRET, "redirect_uri": "http://127.0.0.1:1/callback",
+                "code_verifier": "an-attacker-guess-" + "b" * 30})
         self.assertIn("invalid_grant", str(ctx.exception))
 
 
@@ -291,6 +361,10 @@ class TestTokenFile(AuthTestCase):
         self.assertIn("signed in", text)
         self.assertNotIn("secret", text)
         self.assertEqual(auth.status(self.path, api_key="sk-abc"), "using CANTONESE_AI_API_KEY")
+        with_secret = auth.status(self.path, client_secret=CLIENT_SECRET)
+        self.assertIn("client secret configured: yes", with_secret)
+        self.assertNotIn(CLIENT_SECRET, with_secret)
+        self.assertIn("client secret configured: no", auth.status(self.path, client_secret=""))
 
 
 class TestRefresh(AuthTestCase):
@@ -316,8 +390,10 @@ class TestRefresh(AuthTestCase):
         a = self.make_auth()
         self.assertEqual(a.authorization_header(), "Bearer at-1")
         [req] = self.fake.token_requests
-        self.assertEqual((req["grant_type"], req["refresh_token"], req["client_id"]), ("refresh_token", "rt-0", CLIENT_ID))
-        self.assertNotIn("client_secret", req)
+        self.assertEqual((req["grant_type"], req["refresh_token"], req["client_id"], req["client_secret"]),
+                         ("refresh_token", "rt-0", CLIENT_ID, CLIENT_SECRET))
+        with open(self.path) as f:
+            self.assertNotIn(CLIENT_SECRET, f.read())
         saved = auth.TokenStore(self.path).load()
         self.assertEqual((saved["access_token"], saved["refresh_token"]), ("at-1", "rt-1"))
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
@@ -340,6 +416,25 @@ class TestRefresh(AuthTestCase):
         # A second 401 for the old header does not refresh again (already done).
         self.assertTrue(a.handle_unauthorized(header))
         self.assertEqual(len(self.fake.token_requests), 1)
+
+    def test_refresh_with_wrong_secret_is_invalid_client(self):
+        self.seed(expires_in=0)
+        with self.assertRaises(auth.NotSignedIn) as ctx:
+            self.make_auth(client_secret="wrong-secret").authorization_header()
+        self.assertIn("invalid_client", str(ctx.exception))
+        self.assertIn("CANTONESE_AI_OAUTH_CLIENT_SECRET", str(ctx.exception))
+        self.assertNotIn("wrong-secret", str(ctx.exception))
+        self.assertEqual(auth.TokenStore(self.path).load()["refresh_token"], "rt-0")  # kept for a fixed secret
+
+    def test_refresh_without_secret_needs_configuration(self):
+        self.seed(expires_in=0)
+        with self.assertRaises(auth.NotSignedIn) as ctx:
+            self.make_auth(client_secret="").authorization_header()
+        self.assertIn("CANTONESE_AI_OAUTH_CLIENT_SECRET", str(ctx.exception))
+        self.assertEqual(self.fake.token_requests, [])
+        # A still-valid token works without the secret (nothing to refresh yet).
+        auth.TokenStore(self.path).save(tokens("at-0", "rt-0", 3600))
+        self.assertEqual(self.make_auth(client_secret="").authorization_header(), "Bearer at-0")
 
     def test_revoked_refresh_token_means_sign_in_again(self):
         self.seed(expires_in=0)
@@ -372,7 +467,7 @@ class TestRefresh(AuthTestCase):
         self.assertEqual(set(headers), {"Bearer at-1"})
         self.assertEqual(len(self.fake.token_requests), 1)
 
-    def test_tokens_never_logged(self):
+    def test_tokens_and_client_secret_never_logged(self):
         self.seed(expires_in=0)
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
@@ -389,7 +484,8 @@ class TestRefresh(AuthTestCase):
             logger.removeHandler(handler)
             logger.setLevel(logging.CRITICAL)
         text = stream.getvalue() + str(ctx.exception)
-        for secret in ("at-0", "rt-0", "at-1", "rt-1"):
+        text += repr(self.make_auth())
+        for secret in ("at-0", "rt-0", "at-1", "rt-1", CLIENT_SECRET):
             self.assertNotIn(secret, text)
 
 
@@ -408,6 +504,7 @@ class TestAppSignedIn(AuthTestCase):
         app._auth, app.CANTONESE_AI_API_KEY = None, ""
         app.CANTONESE_AI_TOKEN_PATH, app.CANTONESE_AI_ISSUER = self.path, self.fake.url
         app.CANTONESE_AI_OAUTH_CLIENT_ID = CLIENT_ID
+        app.CANTONESE_AI_OAUTH_CLIENT_SECRET = CLIENT_SECRET
         app.STT_URL, app.STT_TIMEOUT_S = self.fake.url + "/api/stt", 5.0
         self.addCleanup(setattr, app, "_auth", None)
 
@@ -432,6 +529,24 @@ class TestAppSignedIn(AuthTestCase):
             self.app.transcribe(b"AUDIO", "audio/ogg")
         self.assertIn("login", str(ctx.exception))
         self.assertEqual(self.fake.stt_auth, [])
+
+    def test_auth_status_shows_whether_client_secret_is_configured(self):
+        import contextlib
+        for secret, shown in ((CLIENT_SECRET, "yes"), ("", "no")):
+            self.app.CANTONESE_AI_OAUTH_CLIENT_SECRET = secret
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(self.app.cli(["auth-status"]), 0)
+            self.assertIn(f"client secret configured: {shown}", buffer.getvalue())
+            self.assertNotIn(CLIENT_SECRET, buffer.getvalue())
+
+    def test_login_without_client_secret_exits_with_message(self):
+        import contextlib
+        self.app.CANTONESE_AI_OAUTH_CLIENT_SECRET = ""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.app.cli(["login", "--no-browser", "--no-listen"]), 1)
+        self.assertIn("CANTONESE_AI_OAUTH_CLIENT_SECRET", err.getvalue())
 
     def test_api_key_401_not_retried(self):
         self.app.CANTONESE_AI_API_KEY = "sk-wrong"

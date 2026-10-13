@@ -1,9 +1,16 @@
 # WhatsApp voice-note transcription agent: wwebjs-api (WhatsApp Web in headless Chromium)
 # + voice-transcriber (queues voice notes, transcribes them with cantonese.ai, replies).
 #
-#   cp .env.example .env    # then set WWEBJS_API_KEY (openssl rand -hex 32)
-#   docker compose run --rm voice-transcriber python app.py login   # or set CANTONESE_AI_API_KEY
+#   cp .env.example .env    # then set WWEBJS_API_KEY (openssl rand -hex 32) and
+#                           # CANTONESE_AI_OAUTH_CLIENT_SECRET (given to you by the setup bot)
+#   docker compose run --rm -p 127.0.0.1:53682:53682 -e CANTONESE_AI_OAUTH_CALLBACK_BIND=0.0.0.0 \
+#     voice-transcriber python app.py login --no-browser    # or set CANTONESE_AI_API_KEY instead
 #   docker compose up -d
+#
+# The login prints a cantonese.ai sign-in URL: open it in a browser on this machine and sign in.
+# cantonese.ai then sends the browser to http://127.0.0.1:53682/callback (the only registered
+# redirect URI), which the -p flag forwards into the container; its listener has to bind 0.0.0.0
+# for that, hence the -e flag. Port 53682 is published only for this one-off login run.
 #
 # Both ports are bound to 127.0.0.1 only: whoever reaches wwebjs-api can read and send
 # messages as your WhatsApp number. Do not publish them to the internet.
@@ -60,6 +67,10 @@ services:
       WWEBJS_URL: http://wwebjs-api:3000
       DB_PATH: /data/queue.db
       CANTONESE_AI_TOKEN_PATH: /data/cantonese-ai-token.json
+      # "Sign in with cantonese.ai" client (secret from .env; needed for login and token refresh).
+      CANTONESE_AI_OAUTH_CLIENT_ID: ${CANTONESE_AI_OAUTH_CLIENT_ID:-whatsapp-agent}
+      CANTONESE_AI_OAUTH_CLIENT_SECRET: ${CANTONESE_AI_OAUTH_CLIENT_SECRET:-}
+      CANTONESE_AI_OAUTH_CALLBACK_PORT: ${CANTONESE_AI_OAUTH_CALLBACK_PORT:-53682}
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./voice-transcriber:/app:ro

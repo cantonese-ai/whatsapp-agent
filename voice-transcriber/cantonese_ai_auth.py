@@ -4,13 +4,17 @@ Two ways to authenticate, the API key wins when both are configured:
 
 1. CANTONESE_AI_API_KEY: an "sk-..." key from https://cantonese.ai/api-keys, sent as
    "Authorization: Bearer <key>".
-2. "Sign in with cantonese.ai": OAuth 2.0 authorization code flow with PKCE (S256) for a
-   public client (no client secret), run once with `python app.py login`. The access and
-   refresh tokens are kept in a 0600 JSON file (default /data/cantonese-ai-token.json) and
-   refreshed before they expire and whenever the API answers 401. Refresh tokens rotate, so
-   the new one is always saved.
+2. "Sign in with cantonese.ai": OAuth 2.0 authorization code flow for the confidential client
+   `whatsapp-agent`, run once with `python app.py login`. The client secret comes from
+   CANTONESE_AI_OAUTH_CLIENT_SECRET (given to each install by the setup bot / the owner, never
+   in the repository) and is sent as the `client_secret` form field on the code exchange and on
+   every refresh. A PKCE (S256) challenge is sent too. The only registered redirect URI is
+   http://127.0.0.1:53682/callback, so the callback port is fixed (CANTONESE_AI_OAUTH_CALLBACK_PORT).
+   The access and refresh tokens are kept in a 0600 JSON file (default
+   /data/cantonese-ai-token.json) and refreshed before they expire and whenever the API answers
+   401. Refresh tokens rotate, so the new one is always saved.
 
-Tokens are never logged or printed.
+The client secret and the tokens are never logged or printed.
 """
 import base64
 import hashlib
@@ -20,7 +24,6 @@ import logging
 import os
 import queue
 import secrets
-import socket
 import sys
 import tempfile
 import threading
@@ -34,6 +37,15 @@ DEFAULT_ISSUER = "https://cantonese.ai"
 DEFAULT_CLIENT_ID = "whatsapp-agent"
 DEFAULT_SCOPE = "user:inference"
 DEFAULT_TOKEN_PATH = "/data/cantonese-ai-token.json"
+# cantonese.ai matches redirect URIs exactly: http://127.0.0.1:53682/callback is the registered one.
+DEFAULT_CALLBACK_PORT = 53682
+DEFAULT_CALLBACK_BIND = "127.0.0.1"
+# The metadata document is optional (cantonese.ai has none): give up on it quickly.
+DISCOVERY_TIMEOUT_S = 5
+MISSING_SECRET_MESSAGE = (
+    "CANTONESE_AI_OAUTH_CLIENT_SECRET is not set. Sign-in with cantonese.ai needs the client secret "
+    "that the setup bot (or the owner of this install) provides: put it in .env (never in the "
+    "repository), or set CANTONESE_AI_API_KEY instead.")
 # Refresh this many seconds before the access token expires.
 REFRESH_MARGIN_S = 120
 HTTP_TIMEOUT_S = 30
@@ -53,6 +65,21 @@ class StateMismatch(AuthError):
     """The callback's state does not match the one we sent (possible CSRF)."""
 
 
+class MissingClientSecret(AuthError):
+    """CANTONESE_AI_OAUTH_CLIENT_SECRET is not configured."""
+
+
+def _require_secret(client_secret):
+    secret = (client_secret or "").strip()
+    if not secret:
+        raise MissingClientSecret(MISSING_SECRET_MESSAGE)
+    return secret
+
+
+def redirect_uri_for(port=DEFAULT_CALLBACK_PORT):
+    return f"http://127.0.0.1:{int(port)}/callback"
+
+
 # ---------------------------------------------------------------- PKCE / URLs
 
 def _b64url(data):
@@ -69,7 +96,7 @@ def new_pkce_pair():
     return verifier, code_challenge(verifier)
 
 
-def discover(issuer=DEFAULT_ISSUER, timeout=HTTP_TIMEOUT_S):
+def discover(issuer=DEFAULT_ISSUER, timeout=DISCOVERY_TIMEOUT_S):
     """Authorization and token endpoints from RFC 8414 metadata, with fixed fallbacks."""
     issuer = issuer.rstrip("/")
     endpoints = {"authorization_endpoint": f"{issuer}/api/oauth/authorize",
@@ -208,10 +235,11 @@ class CantoneseAiAuth:
     when it changes, so `login` can run while the service is up."""
 
     def __init__(self, api_key=None, token_path=DEFAULT_TOKEN_PATH, client_id=DEFAULT_CLIENT_ID,
-                 issuer=DEFAULT_ISSUER, token_endpoint=None):
+                 issuer=DEFAULT_ISSUER, token_endpoint=None, client_secret=None):
         self.api_key = (api_key or "").strip() or None
         self.store = TokenStore(token_path)
         self.client_id = client_id
+        self._client_secret = (client_secret or "").strip() or None
         self.issuer = issuer
         self._token_endpoint = token_endpoint
         self._lock = threading.Lock()
@@ -261,16 +289,27 @@ class CantoneseAiAuth:
             self._refresh_locked(tokens)
             return True
 
+    def __repr__(self):
+        return f"CantoneseAiAuth(mode={self.mode!r}, client_id={self.client_id!r})"  # no secrets
+
     def _refresh_locked(self, tokens):
         try:
+            secret = _require_secret(self._client_secret)
+        except MissingClientSecret as e:
+            raise NotSignedIn(f"cannot refresh the cantonese.ai sign-in: {e}") from None
+        try:
             body = _token_request(self.token_endpoint(), {
-                "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "client_id": self.client_id})
+                "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
+                "client_id": self.client_id, "client_secret": secret})
         except AuthError as e:
             # Another process may have rotated the refresh token under us; use its result.
             fresh = self.store.load()
             if fresh and fresh.get("refresh_token") != tokens.get("refresh_token"):
                 self._tokens, self._mtime = fresh, self.store.mtime()
                 return fresh
+            if getattr(e, "oauth_error", "") == "invalid_client":
+                raise NotSignedIn("cantonese.ai rejected the OAuth client credentials (invalid_client): check "
+                                  "CANTONESE_AI_OAUTH_CLIENT_ID and CANTONESE_AI_OAUTH_CLIENT_SECRET") from None
             if getattr(e, "status", None) in (400, 401):
                 raise NotSignedIn(f"cantonese.ai sign-in expired or revoked ({e}); run `python app.py login` again") from None
             raise
@@ -283,17 +322,14 @@ class CantoneseAiAuth:
 
 # ---------------------------------------------------------------- interactive login
 
-def _free_loopback_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 class _CallbackServer(http.server.HTTPServer):
-    allow_reuse_address = True
+    # No SO_REUSEADDR: a port that is in use must fail loudly, since the redirect URI is fixed.
+    allow_reuse_address = False
 
 
-def _start_callback_listener(port, results):
+def _start_callback_listener(port, results, bind=DEFAULT_CALLBACK_BIND):
+    """Listen for the redirect on bind:port. bind is 127.0.0.1 except inside a container, where
+    0.0.0.0 lets the host's published port (127.0.0.1:53682 on the host) reach it."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
@@ -311,28 +347,38 @@ def _start_callback_listener(port, results):
         def log_message(self, *args):
             pass  # the request line contains the authorization code
 
-    server = _CallbackServer(("127.0.0.1", port), Handler)  # loopback only
+    try:
+        server = _CallbackServer((bind or DEFAULT_CALLBACK_BIND, int(port)), Handler)
+    except OSError as e:
+        raise AuthError(
+            f"cannot listen on {bind}:{port} for the sign-in callback ({e.strerror or e}). The registered "
+            f"redirect URI is {redirect_uri_for(port)}, so the port cannot change: stop whatever uses port "
+            f"{port} (another login?) and try again, or use `login --no-listen` and paste the redirected URL."
+        ) from None
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
 def login(token_path=DEFAULT_TOKEN_PATH, client_id=DEFAULT_CLIENT_ID, issuer=DEFAULT_ISSUER, scope=DEFAULT_SCOPE,
-          open_browser=True, listen=True, input_fn=input, out=None, timeout_s=600, port=None, endpoints=None):
-    """Run the authorization code + PKCE flow and save the tokens. Returns the saved tokens.
+          open_browser=True, listen=True, input_fn=input, out=None, timeout_s=600, port=DEFAULT_CALLBACK_PORT,
+          endpoints=None, client_secret=None, bind=DEFAULT_CALLBACK_BIND):
+    """Run the authorization code flow (confidential client, plus PKCE) and save the tokens.
+    Returns the saved tokens.
 
     The sign-in URL is printed (and opened in a browser when possible). The code comes back
-    either to a listener on http://127.0.0.1:<port>/callback, or - on a headless server or in a
-    container - from the user pasting the URL their browser ended up on."""
+    either to a listener on bind:port (redirect URI http://127.0.0.1:<port>/callback), or - on a
+    headless server - from the user pasting the URL their browser ended up on."""
     out = out or sys.stdout
+    secret = _require_secret(client_secret)  # fail before the user goes through the browser
+    port = int(port or DEFAULT_CALLBACK_PORT)
+    redirect_uri = redirect_uri_for(port)
     endpoints = endpoints or discover(issuer)
-    port = port or _free_loopback_port()
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
     verifier, challenge = new_pkce_pair()
     state = secrets.token_urlsafe(24)
     url = authorize_url(endpoints["authorization_endpoint"], client_id, redirect_uri, scope, state, challenge)
 
     results = queue.Queue()
-    server = _start_callback_listener(port, results) if listen else None
+    server = _start_callback_listener(port, results, bind) if listen else None
     try:
         print("Sign in with cantonese.ai by opening this URL in a browser:\n\n  " + url + "\n", file=out, flush=True)
         if open_browser:
@@ -341,7 +387,7 @@ def login(token_path=DEFAULT_TOKEN_PATH, client_id=DEFAULT_CLIENT_ID, issuer=DEF
             except Exception:
                 pass
         print("After you approve, the browser goes to " + redirect_uri + " ...\n"
-              "If that page does not load (headless server, container, another computer), copy the full\n"
+              "If that page does not load (headless server, another computer), copy the full\n"
               "address from the browser's address bar and paste it here.", file=out, flush=True)
 
         def read_paste():
@@ -364,21 +410,26 @@ def login(token_path=DEFAULT_TOKEN_PATH, client_id=DEFAULT_CLIENT_ID, issuer=DEF
 
     body = _token_request(endpoints["token_endpoint"], {
         "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri,
-        "client_id": client_id, "code_verifier": verifier})
+        "client_id": client_id, "client_secret": secret, "code_verifier": verifier})
     tokens = _tokens_from_response(body)
     TokenStore(token_path).save(tokens)
     print(f"Signed in. Token saved to {token_path} (readable only by this user).", file=out, flush=True)
     return tokens
 
 
-def status(token_path=DEFAULT_TOKEN_PATH, api_key=None):
-    """A human-readable credential summary without any secret in it."""
+def status(token_path=DEFAULT_TOKEN_PATH, api_key=None, client_secret=None):
+    """A human-readable credential summary without any secret in it. When client_secret is
+    passed (even empty), it also says whether one is configured: yes/no only."""
+    secret_note = ""
+    if client_secret is not None:
+        secret_note = f"; OAuth client secret configured: {'yes' if client_secret.strip() else 'no'}"
     if (api_key or "").strip():
-        return "using CANTONESE_AI_API_KEY"
+        return "using CANTONESE_AI_API_KEY" + secret_note
     tokens = TokenStore(token_path).load()
     if not tokens:
-        return "not signed in (set CANTONESE_AI_API_KEY or run `python app.py login`)"
+        return "not signed in (set CANTONESE_AI_API_KEY or run `python app.py login`)" + secret_note
     left = tokens.get("expires_at", 0) - time.time()
     refresh = "with" if tokens.get("refresh_token") else "without"
     return (f"signed in with cantonese.ai (scope {tokens.get('scope') or 'unknown'}), access token "
-            f"{'expires in %.0f min' % (left / 60) if left > 0 else 'expired'}, {refresh} a refresh token")
+            f"{'expires in %.0f min' % (left / 60) if left > 0 else 'expired'}, {refresh} a refresh token"
+            + secret_note)

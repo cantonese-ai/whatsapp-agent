@@ -9,8 +9,9 @@ voice note:
 
 It is built for Cantonese, and works for the other languages the cantonese.ai API supports
 (`STT_LANG`). You link your own WhatsApp number to it like WhatsApp Desktop, and sign in with your
-cantonese.ai account (or use an API key). Voice notes you send and receive are transcribed, in
-direct chats and groups.
+cantonese.ai account (or, optionally, use an API key). Voice notes you send and receive are
+transcribed, in direct chats and groups. Usage is billed to the signed-in cantonese.ai account,
+which needs a speech-to-text plan.
 
 ## How it works
 
@@ -44,7 +45,9 @@ direct chats and groups.
 
 ## Quick start
 
-Requirements: Docker with Compose, a phone with WhatsApp, a [cantonese.ai](https://cantonese.ai) account.
+Requirements: Docker with Compose, a phone with WhatsApp, a [cantonese.ai](https://cantonese.ai)
+account with a speech-to-text plan, and the `whatsapp-agent` OAuth client secret (provided by
+cantonese.ai / the setup bot; not needed if you use an API key instead).
 
 ```bash
 git clone https://github.com/cantonese-ai/whatsapp-agent.git
@@ -55,8 +58,11 @@ cp .env.example .env && chmod 600 .env
 #    Generate your own; anyone holding it controls the linked WhatsApp account.
 sed -i.bak "s/^WWEBJS_API_KEY=.*/WWEBJS_API_KEY=$(openssl rand -hex 32)/" .env && rm .env.bak
 
-# 2. Sign in with your cantonese.ai account (or set CANTONESE_AI_API_KEY in .env instead).
-docker compose run --rm voice-transcriber python app.py login
+# 2. Put the client secret you were given into .env (CANTONESE_AI_OAUTH_CLIENT_SECRET=...) with an
+#    editor, then sign in with your cantonese.ai account: open the printed URL in a browser on
+#    this machine. (Or set CANTONESE_AI_API_KEY in .env instead.)
+docker compose run --rm -p 127.0.0.1:53682:53682 -e CANTONESE_AI_OAUTH_CALLBACK_BIND=0.0.0.0 \
+  voice-transcriber python app.py login --no-browser
 
 # 3. Start.
 docker compose up -d
@@ -69,21 +75,33 @@ Send yourself a voice note ("Message yourself"); a `📝` reply should follow wi
 
 ## Sign in with cantonese.ai
 
-`python app.py login` runs the OAuth 2.0 authorization code flow with PKCE (S256) as a *public*
-client: there is no client secret in this repository or on your host.
+Signing in uses the normal cantonese.ai login page, like cantonese.ai's other apps (OAuth 2.0
+authorization code flow, client id `whatsapp-agent`). The agent authenticates itself to
+cantonese.ai with a client secret, `CANTONESE_AI_OAUTH_CLIENT_SECRET`, which cantonese.ai / the
+setup bot gives you. Keep it in `.env` only: never in the repository, chat logs or issues. It is
+needed for the sign-in and for every token refresh.
 
-1. It prints a sign-in URL (and opens a browser when it can).
+1. `python app.py login` prints a sign-in URL (and opens a browser when it can; `--no-browser`
+   only prints it).
 2. You sign in at cantonese.ai and approve access (scope `user:inference`).
-3. The browser is sent to `http://127.0.0.1:<random port>/callback`. On a desktop the agent
-   listens there (on 127.0.0.1 only) and finishes by itself. On a server or inside Docker that page
-   will not load; copy the full URL from the address bar and paste it at the prompt.
-   `login --no-browser` skips the browser and the listener and only asks for the pasted URL.
+3. The browser is sent to `http://127.0.0.1:53682/callback`, the only registered redirect URI, so
+   the port is fixed. The agent listens there and finishes by itself. With Docker the command in
+   Quick start publishes `127.0.0.1:53682` into the container for the login run only, and tells
+   the listener to bind `0.0.0.0` inside it (`CANTONESE_AI_OAUTH_CALLBACK_BIND`). If port 53682 is
+   busy the login stops with an error instead of picking another port. When the browser is on
+   another computer, that page will not load: copy the full URL from the address bar and paste it
+   at the prompt (`--no-listen` skips the listener and only waits for the paste).
 4. The access token, refresh token and expiry are saved to `/data/cantonese-ai-token.json` (file
    mode 0600, on the `transcriber-data` volume). The token is refreshed before it expires and after
-   a 401; refresh tokens rotate and the new one is always saved. Tokens are never logged.
+   a 401; refresh tokens rotate and the new one is always saved. Neither the tokens nor the client
+   secret are ever logged or written to the token file.
 
-Other commands: `python app.py auth-status` (which credential is used, without showing it) and
-`python app.py logout`. If `CANTONESE_AI_API_KEY` is set it is used instead of the sign-in.
+Other commands: `python app.py auth-status` (which credential is used and whether a client secret
+is configured, without showing either) and `python app.py logout`.
+
+**Optional: API key.** Instead of signing in, set `CANTONESE_AI_API_KEY` to an `sk-...` key from
+https://cantonese.ai/api-keys; no client secret is needed then. If both are set, the API key is
+used.
 
 While neither credential works, voice notes stay queued and are retried; after signing in again,
 re-queue anything that ended up failed (see Operating).
@@ -118,9 +136,12 @@ All variables are documented in [`.env.example`](.env.example). The main ones:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WWEBJS_API_KEY` | (required) | Shared secret for wwebjs-api, its webhooks and the transcriber's admin API. `openssl rand -hex 32`. |
-| `CANTONESE_AI_API_KEY` | empty | `sk-...` key from https://cantonese.ai/api-keys. Wins over the sign-in. |
-| `CANTONESE_AI_OAUTH_CLIENT_ID` | `whatsapp-agent` | Public OAuth client id for the sign-in. |
-| `CANTONESE_AI_ISSUER` | `https://cantonese.ai` | Authorization server (metadata at `/.well-known/oauth-authorization-server`). |
+| `CANTONESE_AI_OAUTH_CLIENT_ID` | `whatsapp-agent` | OAuth client id for the sign-in. |
+| `CANTONESE_AI_OAUTH_CLIENT_SECRET` | empty | OAuth client secret, provided by cantonese.ai / the setup bot. Keep private. Needed for sign-in and refresh. |
+| `CANTONESE_AI_OAUTH_CALLBACK_PORT` | `53682` | Callback port; must match the registered redirect URI `http://127.0.0.1:53682/callback`. |
+| `CANTONESE_AI_OAUTH_CALLBACK_BIND` | `127.0.0.1` | Listener address for the callback; `0.0.0.0` only for the Docker login run. |
+| `CANTONESE_AI_API_KEY` | empty | Optional `sk-...` key from https://cantonese.ai/api-keys instead of signing in. Wins over the sign-in. |
+| `CANTONESE_AI_ISSUER` | `https://cantonese.ai` | Authorization server (`/api/oauth/authorize`, `/api/oauth/token`). |
 | `CANTONESE_AI_TOKEN_PATH` | `/data/cantonese-ai-token.json` | Saved sign-in (0600). |
 | `STT_URL` | `https://cantonese.ai/api/stt` | Speech-to-text endpoint. |
 | `STT_LANG` | `cantonese` | Language sent to the API. |
@@ -152,10 +173,11 @@ old) and `reply_unknown` (the reply may have been sent; never retried automatica
 Update with `git pull && docker compose pull && docker compose up -d`. The patched `sessions.js`
 belongs to one wwebjs-api version; change the image tag only together with it.
 
-## Limits
+## Billing
 
-Without a paid cantonese.ai plan, speech-to-text is limited to **10 requests per day, each up to
-5 minutes of audio**. Every transcribed voice note is one request. See https://cantonese.ai for plans.
+Every transcribed voice note is one speech-to-text request, billed to the signed-in cantonese.ai
+account (or the account that owns the API key). That account needs a speech-to-text plan; see
+https://cantonese.ai for plans. Without one the API answers 401/402 and jobs end up `failed`.
 
 ## Privacy and safety
 
@@ -173,7 +195,9 @@ Without a paid cantonese.ai plan, speech-to-text is limited to **10 requests per
 ## Kubernetes
 
 Optional manifests are in [`k8s/`](k8s/) (namespace `whatsapp-agent`, Secrets referenced by name;
-create them as described at the top of each manifest):
+create them as described at the top of each manifest; the OAuth client id and secret come from the
+optional Secret `whatsapp-agent-oauth-client`). In the login below, paste the redirected URL at the
+prompt:
 
 ```bash
 kubectl kustomize --load-restrictor LoadRestrictionsNone k8s | kubectl apply -f -
