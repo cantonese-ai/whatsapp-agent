@@ -76,6 +76,32 @@ docker compose ps          # both services "healthy" after about a minute
 docker compose logs -f voice-transcriber
 ```
 
+Check that the containers can resolve WhatsApp **before** pairing (no QR code appears otherwise):
+
+```bash
+docker compose exec -T wwebjs-api getent hosts web.whatsapp.com   # must print an address
+```
+
+If it prints nothing, the host's DNS is not reachable from containers (typical with
+systemd-resolved's `127.0.0.53`, VPNs or firewalled networks). Fix it **for these two containers
+only** -- do not restart the Docker daemon or edit `/etc/docker/daemon.json` on a shared server:
+
+```bash
+cat > docker-compose.override.yml <<'YAML'
+services:
+  wwebjs-api:
+    dns: [1.1.1.1, 8.8.8.8]
+  voice-transcriber:
+    dns: [1.1.1.1, 8.8.8.8]
+YAML
+docker compose up -d --force-recreate
+docker compose exec -T wwebjs-api getent hosts web.whatsapp.com
+```
+
+Use the network's own resolvers instead of 1.1.1.1 / 8.8.8.8 if outbound DNS is blocked. Also check
+`docker compose exec -T voice-transcriber python -c "import socket; print(socket.gethostbyname('cantonese.ai'))"`.
+A session started while DNS was broken can stay stuck: `GET /session/terminate/<id>`, then pair again.
+
 ## 5. Link the phone
 
 Choose a session id (letters, digits, hyphens), e.g. `demo`.

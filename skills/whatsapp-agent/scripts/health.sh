@@ -16,6 +16,10 @@ printf 'job counts:             '; api "$TRANSCRIBER/jobs?limit=1" | python3 -c 
 printf 'recent failures:        '; api "$TRANSCRIBER/jobs?status=failed&limit=5" | python3 -c 'import json,sys
 for j in json.load(sys.stdin).get("jobs", []): print("\n  ", j["id"], j["last_error"], end="")
 print()' || ok=1
+printf 'DNS (inside containers): '
+(cd "$REPO_ROOT" && docker compose exec -T wwebjs-api getent hosts web.whatsapp.com >/dev/null 2>&1 \
+  && docker compose exec -T voice-transcriber python -c "import socket; socket.gethostbyname('cantonese.ai')" >/dev/null 2>&1 \
+  && echo ok) || { echo "FAILED -- see 'DNS' in skills/whatsapp-agent/SKILL.md (docker-compose.override.yml with dns:)"; ok=1; }
 printf 'cantonese.ai credential: '
 (cd "$REPO_ROOT" && docker compose exec -T voice-transcriber python app.py auth-status 2>/dev/null) || echo "(docker compose not available here)"
 exit $ok

@@ -108,6 +108,11 @@ re-queue anything that ended up failed (see Operating).
 
 ## Linking a phone
 
+If no QR code ever appears, first check DNS inside the containers:
+`docker compose exec -T wwebjs-api getent hosts web.whatsapp.com`. If that prints nothing, add a
+`docker-compose.override.yml` with `dns: [1.1.1.1, 8.8.8.8]` for both services and run
+`docker compose up -d --force-recreate` (details in `skills/whatsapp-agent/SKILL.md`).
+
 All wwebjs-api endpoints need the header `x-api-key: <WWEBJS_API_KEY>` and are on
 `http://127.0.0.1:3000` (paths checked against wwebjs-api v1.34.7-hotfix2):
 
