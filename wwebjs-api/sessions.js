@@ -23,6 +23,8 @@
 //   - catch-up: voice notes that arrived while the session was offline are re-sent on 'ready'
 //   - faster first-note pickup for brand-new chats: downloadMedia retries, media_uploaded,
 //     targeted per-chat catch-up, recent aggressive scan, catch-up sorted by last activity
+//   - catch-up dedupes in-process (no re-POST of already-webhooked msg ids); prefer recent
+//     over full when the shared catch-up lock is contended
 // The per-session webhook override (<SESSIONID>_WEBHOOK_URL) is upstream behaviour and is also
 // used for the new events. Keep this file in step with the image tag in docker-compose.yml.
 
@@ -420,6 +422,8 @@ const initializeEvents = (client, sessionId) => {
     })
   }
 
+  // Filled by the media/catch-up patch below so live inbound media is remembered too.
+  let markVoiceSentHook = (_message) => {}
   client.on('message', async (message) => {
     if (isEventEnabled('message')) {
       triggerWebhook(sessionWebhook, sessionId, 'message', { message })
@@ -432,6 +436,7 @@ const initializeEvents = (client, sessionId) => {
             if (!messageMedia) return
             triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message })
             triggerWebSocket(sessionId, 'media', { messageMedia, message })
+            markVoiceSentHook(message)
           }).catch(error => {
             logger.error({ sessionId, err: error }, 'Failed to download media')
           })
@@ -475,10 +480,32 @@ const initializeEvents = (client, sessionId) => {
       if (message.fromMe) return message.to || message.id?.remote
       return message.from || message.id?.remote
     }
+    // In-process dedupe for catch-up / live emits: avoid re-downloading and re-POSTing the
+    // same voice note every recent/full scan. Cleared on process restart (ready catch-up
+    // still recovers truly missed notes). Keys older than the widest lookback are pruned.
+    const catchupSentKeys = new Map() // msg id._serialized -> sentAtMs
+    const voiceNoteKey = (message) => message?.id?._serialized || message?.id?.id || null
+    const markVoiceSent = (message) => {
+      const key = voiceNoteKey(message)
+      if (key) catchupSentKeys.set(key, Date.now())
+    }
+    const wasVoiceSent = (message) => {
+      const key = voiceNoteKey(message)
+      return Boolean(key && catchupSentKeys.has(key))
+    }
+    let catchupSentMaxAgeSeconds = 3600 + 120 // updated once catch-up env is read below
+    const pruneCatchupSent = () => {
+      const cutoff = Date.now() - catchupSentMaxAgeSeconds * 1000
+      for (const [k, t] of catchupSentKeys) {
+        if (t < cutoff) catchupSentKeys.delete(k)
+      }
+    }
+    markVoiceSentHook = markVoiceSent
     const emitOwnVoiceMedia = (message, messageMedia, extra = {}) => {
       if (!messageMedia) return false
       triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message, ...extra })
       triggerWebSocket(sessionId, 'media', { messageMedia, message, ...extra })
+      markVoiceSent(message)
       return true
     }
     // Backoff while WhatsApp companion finishes discovering a new chat / resolving media.
@@ -559,51 +586,64 @@ const initializeEvents = (client, sessionId) => {
     }
     // Periodic catch-up: WhatsApp often delays delivering outbound (from_me) voice notes to
     // the linked companion. Scanning recent chats on a timer picks those up without waiting
-    // for a reconnect; voice-transcriber dedupes by msg_key.
+    // for a reconnect. We skip ids already webhooked this process; voice-transcriber still
+    // dedupes by msg_key as a safety net across restarts.
     const catchupIntervalSeconds = parseInt(process.env.CATCHUP_INTERVAL_SECONDS || '120')
     const catchupLookbackSeconds = parseInt(process.env.CATCHUP_LOOKBACK_SECONDS || '1800')
     // Aggressive short window: brand-new chats often appear in getChats within seconds but
     // would otherwise wait for the 2-minute full scan. Keep lookback short to avoid hammering.
     const catchupRecentIntervalSeconds = parseInt(process.env.CATCHUP_RECENT_INTERVAL_SECONDS || '20')
     const catchupRecentLookbackSeconds = parseInt(process.env.CATCHUP_RECENT_LOOKBACK_SECONDS || '300')
+    catchupSentMaxAgeSeconds = Math.max(catchupLookbackSeconds, catchupMaxSeconds, catchupRecentLookbackSeconds) + 120
     let catchupTimer = null
     let catchupRecentTimer = null
     let catchupRunning = false
+    let catchupRunningMode = null
+    let catchupRecentPending = null // { delayMs } — run recent after a contended full scan
     const targetedPending = new Map() // chatId -> timeout
     const targetedInFlight = new Set()
 
     const scanChatVoiceNotes = async (chat, from) => {
       let sent = 0
-      if (!chat || chat.id?._serialized === 'status@broadcast') return 0
+      let skippedAlready = 0
+      if (!chat || chat.id?._serialized === 'status@broadcast') return { sent: 0, skippedAlready: 0 }
       const messages = await chat.fetchMessages({ limit: 300 })
       for (const message of messages) {
         if (!ownVoiceTypes.includes(message.type) || message.timestamp < from) continue
         if (!message.hasMedia || !mediaSizeOk(message)) continue
+        if (wasVoiceSent(message)) {
+          skippedAlready++
+          continue
+        }
         try {
           const messageMedia = await message.downloadMedia()
           if (!messageMedia) continue
           // catchUp: the transcript may already be in the chat; voice-transcriber checks first.
           triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message, catchUp: true })
+          markVoiceSent(message)
           sent++
         } catch (err) {
           logger.error({ sessionId, err, chatId: chat.id?._serialized }, 'Voice note catch-up: download failed')
         }
       }
-      return sent
+      return { sent, skippedAlready }
     }
 
     const catchUpChat = async (chatId, from, reason) => {
       if (!chatId || chatId === 'status@broadcast' || targetedInFlight.has(chatId)) return
       targetedInFlight.add(chatId)
       let sent = 0
+      let skippedAlready = 0
       try {
         const chat = await client.getChatById(chatId)
         if (!chat) {
           logger.info({ sessionId, chatId, reason }, 'Voice note targeted catch-up: chat not ready yet')
           return
         }
-        sent = await scanChatVoiceNotes(chat, from)
-        logger.info({ sessionId, chatId, since: from, sent, reason }, 'Voice note targeted catch-up done')
+        const result = await scanChatVoiceNotes(chat, from)
+        sent = result.sent
+        skippedAlready = result.skippedAlready
+        logger.info({ sessionId, chatId, since: from, sent, skippedAlready, reason }, 'Voice note targeted catch-up done')
       } catch (err) {
         logger.error({ sessionId, err, chatId, reason }, 'Voice note targeted catch-up failed')
       } finally {
@@ -677,29 +717,50 @@ const initializeEvents = (client, sessionId) => {
     })
     const catchUp = async (from, delayMs, mode = 'full') => {
       if (catchupRunning) {
-        logger.info({ sessionId, mode }, 'Voice note catch-up skipped (already running)')
+        // Prefer recent/targeted freshness: defer a recent scan to run right after the
+        // current one instead of dropping it behind a long full scan.
+        if (mode === 'recent') {
+          catchupRecentPending = { delayMs }
+          logger.info({ sessionId, mode, running: catchupRunningMode }, 'Voice note catch-up deferred (will run after current)')
+        } else {
+          logger.info({ sessionId, mode, running: catchupRunningMode }, 'Voice note catch-up skipped (already running)')
+        }
         return
       }
       catchupRunning = true
+      catchupRunningMode = mode
       let sent = 0
+      let skippedAlready = 0
       let scanned = 0
       try {
+        pruneCatchupSent()
         const chats = await client.getChats()
         // Newest activity first: brand-new chats otherwise sit at the end of a long scan.
         chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+        // Full scans can starve recent work; cap chat fetches now that in-process dedupe
+        // means we mostly confirm emptiness rather than re-send.
+        const scanCap = mode === 'recent' ? 25 : 80
         for (const chat of chats) {
           if (!chat.timestamp || chat.timestamp < from || chat.id?._serialized === 'status@broadcast') continue
           scanned++
-          sent += await scanChatVoiceNotes(chat, from)
-          // Recent mode: only the hottest chats; stop once we pass the recent window edge
-          // (already filtered by timestamp) — cap work to keep WA load light.
-          if (mode === 'recent' && scanned >= 25) break
+          const result = await scanChatVoiceNotes(chat, from)
+          sent += result.sent
+          skippedAlready += result.skippedAlready
+          if (scanned >= scanCap) break
         }
-        logger.info({ sessionId, since: from, sent, scanned, mode, afterSeconds: delayMs / 1000 }, 'Voice note catch-up done')
+        logger.info({ sessionId, since: from, sent, skippedAlready, scanned, mode, afterSeconds: delayMs / 1000, remembered: catchupSentKeys.size }, 'Voice note catch-up done')
       } catch (err) {
         logger.error({ sessionId, err, mode }, 'Voice note catch-up failed')
       } finally {
         catchupRunning = false
+        catchupRunningMode = null
+        if (catchupRecentPending) {
+          const pending = catchupRecentPending
+          catchupRecentPending = null
+          const now = Math.floor(Date.now() / 1000)
+          const fromRecent = now - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
+          setImmediate(() => { catchUp(fromRecent, pending.delayMs, 'recent') })
+        }
       }
     }
     // WhatsApp can end a link without a LOGOUT event (a fresh link can drop after a few minutes and
