@@ -288,9 +288,14 @@ def backoff_s(attempt, retry_after=None):
 
 # ---------------------------------------------------------------- http clients
 
+# Cloudflare on cantonese.ai rejects Python-urllib's default User-Agent (HTTP 403, error 1010).
+_DEFAULT_UA = os.environ.get("HTTP_USER_AGENT", "cantonese-ai-whatsapp-agent/1.0")
+
+
 def post_json(url, body, headers, timeout=60):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                 headers={"content-type": "application/json", **headers})
+                                 headers={"content-type": "application/json",
+                                          "User-Agent": _DEFAULT_UA, **headers})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
@@ -305,7 +310,8 @@ def post_multipart(url, fields, files, headers, timeout=300):
                      f'Content-Type: {ctype}\r\n\r\n'.encode() + data + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     req = urllib.request.Request(url, data=b"".join(parts), method="POST",
-                                 headers={"content-type": f"multipart/form-data; boundary={boundary}", **headers})
+                                 headers={"content-type": f"multipart/form-data; boundary={boundary}",
+                                          "User-Agent": _DEFAULT_UA, **headers})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 

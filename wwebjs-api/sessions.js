@@ -21,6 +21,8 @@
 //   - session_paired / session_removed webhook events when a number is linked or unlinked
 //   - your own voice notes are forwarded as 'media' events too (the stock 'message' event skips them)
 //   - catch-up: voice notes that arrived while the session was offline are re-sent on 'ready'
+//   - faster first-note pickup for brand-new chats: downloadMedia retries, media_uploaded,
+//     targeted per-chat catch-up, recent aggressive scan, catch-up sorted by last activity
 // The per-session webhook override (<SESSIONID>_WEBHOOK_URL) is upstream behaviour and is also
 // used for the new events. Keep this file in step with the image tag in docker-compose.yml.
 
@@ -422,10 +424,12 @@ const initializeEvents = (client, sessionId) => {
     if (isEventEnabled('message')) {
       triggerWebhook(sessionWebhook, sessionId, 'message', { message })
       triggerWebSocket(sessionId, 'message', { message })
-      if (message.hasMedia && message._data?.size < maxAttachmentSize) {
+      // cantonese.ai patch: missing _data.size (common on freshly synced chats) must not skip download
+      if (message.hasMedia && (message._data?.size == null || message._data.size < maxAttachmentSize)) {
       // custom service event
         if (isEventEnabled('media')) {
           message.downloadMedia().then(messageMedia => {
+            if (!messageMedia) return
             triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message })
             triggerWebSocket(sessionId, 'media', { messageMedia, message })
           }).catch(error => {
@@ -458,25 +462,88 @@ const initializeEvents = (client, sessionId) => {
   // cantonese.ai patch: 'message' skips our own messages, so also download our own voice
   // notes (e.g. "Message yourself") for voice-transcriber. The REST download endpoints can't
   // find them afterwards (fetchMessages({ messageId }) returns nothing on this version).
+  // Brand-new chats often fire message_create before media is RESOLVED (or without _data.size);
+  // retry downloadMedia and fall back to a targeted per-chat catch-up instead of waiting for
+  // the full 2-minute getChats scan.
   if (isEventEnabled('media')) {
-    client.on('message_create', (message) => {
-      if (!message.fromMe || !['ptt', 'audio'].includes(message.type)) return
-      if (!message.hasMedia || !(message._data?.size < maxAttachmentSize)) return
-      message.downloadMedia().then(messageMedia => {
-        triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message })
-        triggerWebSocket(sessionId, 'media', { messageMedia, message })
-      }).catch(error => {
-        logger.error({ sessionId, err: error }, 'Failed to download own media')
+    const ownVoiceTypes = ['ptt', 'audio']
+    const mediaSizeOk = (message) => {
+      const size = message._data?.size
+      return size == null || size < maxAttachmentSize
+    }
+    const chatIdOf = (message) => {
+      if (message.fromMe) return message.to || message.id?.remote
+      return message.from || message.id?.remote
+    }
+    const emitOwnVoiceMedia = (message, messageMedia, extra = {}) => {
+      if (!messageMedia) return false
+      triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message, ...extra })
+      triggerWebSocket(sessionId, 'media', { messageMedia, message, ...extra })
+      return true
+    }
+    // Backoff while WhatsApp companion finishes discovering a new chat / resolving media.
+    const downloadOwnVoiceWithRetry = async (message) => {
+      const delaysMs = [0, 1000, 2000, 5000, 10000]
+      let lastErr = null
+      for (let i = 0; i < delaysMs.length; i++) {
+        if (delaysMs[i] > 0) await sleep(delaysMs[i])
+        try {
+          if (!message.hasMedia || !mediaSizeOk(message)) {
+            // Refresh from store if the create event lacked media metadata.
+            try {
+              const chat = await client.getChatById(chatIdOf(message))
+              if (chat) {
+                const recent = await chat.fetchMessages({ limit: 20 })
+                const match = recent.find(m => m.id?._serialized === message.id?._serialized)
+                if (match) message = match
+              }
+            } catch (_) {}
+            if (!message.hasMedia || !mediaSizeOk(message)) continue
+          }
+          const messageMedia = await message.downloadMedia()
+          if (messageMedia) return { message, messageMedia }
+        } catch (err) {
+          lastErr = err
+        }
+      }
+      if (lastErr) logger.error({ sessionId, err: lastErr, chatId: chatIdOf(message) }, 'Failed to download own media after retries')
+      return null
+    }
+    // Populated inside the catch-up block below; safe no-op until then.
+    let scheduleTargetedCatchUp = (_chatId) => {}
+
+    const handleOwnVoiceCreate = (message) => {
+      if (!message.fromMe || !ownVoiceTypes.includes(message.type)) return
+      downloadOwnVoiceWithRetry(message).then((got) => {
+        if (got && emitOwnVoiceMedia(got.message, got.messageMedia)) return
+        const chatId = chatIdOf(message)
+        if (chatId) scheduleTargetedCatchUp(chatId)
+      }).catch((err) => {
+        logger.error({ sessionId, err }, 'Failed to download own media')
+        const chatId = chatIdOf(message)
+        if (chatId) scheduleTargetedCatchUp(chatId)
+      })
+    }
+    client.on('message_create', handleOwnVoiceCreate)
+    // media_uploaded is disabled in DISABLED_CALLBACKS (no webhook noise), but for notes
+    // composed on this linked device it fires when upload finishes — ideal for immediate STT.
+    client.on('media_uploaded', (message) => {
+      if (!message.fromMe || !ownVoiceTypes.includes(message.type)) return
+      if (!message.hasMedia || !mediaSizeOk(message)) return
+      message.downloadMedia().then((messageMedia) => {
+        emitOwnVoiceMedia(message, messageMedia)
+      }).catch((err) => {
+        logger.error({ sessionId, err }, 'Failed to download own media after upload')
+        const chatId = chatIdOf(message)
+        if (chatId) scheduleTargetedCatchUp(chatId)
       })
     })
-  }
 
   // cantonese.ai patch: catch up on voice notes that arrived while this session was not
   // connected (e.g. a container restart). The time the
   // session was last connected is kept in its folder; on 'ready' every ptt/audio since then
   // is re-sent as 'media' and voice-transcriber drops the ones it already has. A session's
   // first link has no saved time, so old voice notes are never transcribed.
-  if (isEventEnabled('media')) {
     const lastSeenPath = cantoneseAiLastSeenPath(sessionId)
     // Never older than an hour by default: posting transcripts hours late is unwanted.
     const catchupMaxSeconds = parseInt(process.env.CATCHUP_MAX_SECONDS || '3600')
@@ -490,6 +557,79 @@ const initializeEvents = (client, sessionId) => {
         logger.error({ sessionId, err }, 'Failed to save last_seen')
       }
     }
+    // Periodic catch-up: WhatsApp often delays delivering outbound (from_me) voice notes to
+    // the linked companion. Scanning recent chats on a timer picks those up without waiting
+    // for a reconnect; voice-transcriber dedupes by msg_key.
+    const catchupIntervalSeconds = parseInt(process.env.CATCHUP_INTERVAL_SECONDS || '120')
+    const catchupLookbackSeconds = parseInt(process.env.CATCHUP_LOOKBACK_SECONDS || '1800')
+    // Aggressive short window: brand-new chats often appear in getChats within seconds but
+    // would otherwise wait for the 2-minute full scan. Keep lookback short to avoid hammering.
+    const catchupRecentIntervalSeconds = parseInt(process.env.CATCHUP_RECENT_INTERVAL_SECONDS || '20')
+    const catchupRecentLookbackSeconds = parseInt(process.env.CATCHUP_RECENT_LOOKBACK_SECONDS || '300')
+    let catchupTimer = null
+    let catchupRecentTimer = null
+    let catchupRunning = false
+    const targetedPending = new Map() // chatId -> timeout
+    const targetedInFlight = new Set()
+
+    const scanChatVoiceNotes = async (chat, from) => {
+      let sent = 0
+      if (!chat || chat.id?._serialized === 'status@broadcast') return 0
+      const messages = await chat.fetchMessages({ limit: 300 })
+      for (const message of messages) {
+        if (!ownVoiceTypes.includes(message.type) || message.timestamp < from) continue
+        if (!message.hasMedia || !mediaSizeOk(message)) continue
+        try {
+          const messageMedia = await message.downloadMedia()
+          if (!messageMedia) continue
+          // catchUp: the transcript may already be in the chat; voice-transcriber checks first.
+          triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message, catchUp: true })
+          sent++
+        } catch (err) {
+          logger.error({ sessionId, err, chatId: chat.id?._serialized }, 'Voice note catch-up: download failed')
+        }
+      }
+      return sent
+    }
+
+    const catchUpChat = async (chatId, from, reason) => {
+      if (!chatId || chatId === 'status@broadcast' || targetedInFlight.has(chatId)) return
+      targetedInFlight.add(chatId)
+      let sent = 0
+      try {
+        const chat = await client.getChatById(chatId)
+        if (!chat) {
+          logger.info({ sessionId, chatId, reason }, 'Voice note targeted catch-up: chat not ready yet')
+          return
+        }
+        sent = await scanChatVoiceNotes(chat, from)
+        logger.info({ sessionId, chatId, since: from, sent, reason }, 'Voice note targeted catch-up done')
+      } catch (err) {
+        logger.error({ sessionId, err, chatId, reason }, 'Voice note targeted catch-up failed')
+      } finally {
+        targetedInFlight.delete(chatId)
+      }
+    }
+
+    scheduleTargetedCatchUp = (chatId) => {
+      if (!chatId || chatId === 'status@broadcast') return
+      if (targetedPending.has(chatId)) return
+      // Small delay so WA can finish writing the new chat / media before we fetch.
+      const t = setTimeout(() => {
+        targetedPending.delete(chatId)
+        const now = Math.floor(Date.now() / 1000)
+        const from = now - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
+        catchUpChat(chatId, from, 'message_create_retry').catch(() => {})
+        // One more pass shortly after: new @lid chats sometimes appear a few seconds later.
+        setTimeout(() => {
+          const now2 = Math.floor(Date.now() / 1000)
+          const from2 = now2 - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
+          catchUpChat(chatId, from2, 'message_create_retry_2').catch(() => {})
+        }, 15000)
+      }, 2000)
+      targetedPending.set(chatId, t)
+    }
+
     client.on('ready', async () => {
       let since = null
       try {
@@ -500,6 +640,29 @@ const initializeEvents = (client, sessionId) => {
       })
       await saveLastSeen()
       if (!lastSeenTimer) lastSeenTimer = setInterval(saveLastSeen, 30000)
+      if (!catchupTimer && catchupIntervalSeconds > 0) {
+        catchupTimer = setInterval(() => {
+          const now = Math.floor(Date.now() / 1000)
+          const from = now - Math.min(catchupLookbackSeconds, catchupMaxSeconds)
+          catchUp(from, catchupIntervalSeconds * 1000, 'full')
+        }, catchupIntervalSeconds * 1000)
+      }
+      if (!catchupRecentTimer && catchupRecentIntervalSeconds > 0) {
+        catchupRecentTimer = setInterval(() => {
+          const now = Math.floor(Date.now() / 1000)
+          const from = now - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
+          catchUp(from, catchupRecentIntervalSeconds * 1000, 'recent')
+        }, catchupRecentIntervalSeconds * 1000)
+      }
+      if (catchupIntervalSeconds > 0 || catchupRecentIntervalSeconds > 0) {
+        logger.info({
+          sessionId,
+          everySeconds: catchupIntervalSeconds,
+          lookbackSeconds: catchupLookbackSeconds,
+          recentEverySeconds: catchupRecentIntervalSeconds,
+          recentLookbackSeconds: catchupRecentLookbackSeconds
+        }, 'Voice note periodic catch-up armed')
+      }
       if (!since) {
         logger.info({ sessionId }, 'Voice note catch-up: first connection, nothing to catch up')
         return
@@ -509,34 +672,34 @@ const initializeEvents = (client, sessionId) => {
       // A freshly (re-)linked device downloads chat history gradually, so look again later;
       // voice-transcriber drops notes it already has.
       for (const delayMs of [0, 60000, 300000]) {
-        setTimeout(() => catchUp(from, delayMs), delayMs)
+        setTimeout(() => catchUp(from, delayMs, 'ready'), delayMs)
       }
     })
-    const catchUp = async (from, delayMs) => {
+    const catchUp = async (from, delayMs, mode = 'full') => {
+      if (catchupRunning) {
+        logger.info({ sessionId, mode }, 'Voice note catch-up skipped (already running)')
+        return
+      }
+      catchupRunning = true
       let sent = 0
+      let scanned = 0
       try {
         const chats = await client.getChats()
+        // Newest activity first: brand-new chats otherwise sit at the end of a long scan.
+        chats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
         for (const chat of chats) {
           if (!chat.timestamp || chat.timestamp < from || chat.id?._serialized === 'status@broadcast') continue
-          // Busy chats: 50 messages may not reach back far enough.
-          const messages = await chat.fetchMessages({ limit: 300 })
-          for (const message of messages) {
-            if (!['ptt', 'audio'].includes(message.type) || message.timestamp < from) continue
-            if (!message.hasMedia || !(message._data?.size < maxAttachmentSize)) continue
-            try {
-              const messageMedia = await message.downloadMedia()
-              if (!messageMedia) continue
-              // catchUp: the transcript may already be in the chat; voice-transcriber checks first.
-              triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message, catchUp: true })
-              sent++
-            } catch (err) {
-              logger.error({ sessionId, err }, 'Voice note catch-up: download failed')
-            }
-          }
+          scanned++
+          sent += await scanChatVoiceNotes(chat, from)
+          // Recent mode: only the hottest chats; stop once we pass the recent window edge
+          // (already filtered by timestamp) — cap work to keep WA load light.
+          if (mode === 'recent' && scanned >= 25) break
         }
-        logger.info({ sessionId, since: from, sent, afterSeconds: delayMs / 1000 }, 'Voice note catch-up done')
+        logger.info({ sessionId, since: from, sent, scanned, mode, afterSeconds: delayMs / 1000 }, 'Voice note catch-up done')
       } catch (err) {
-        logger.error({ sessionId, err }, 'Voice note catch-up failed')
+        logger.error({ sessionId, err, mode }, 'Voice note catch-up failed')
+      } finally {
+        catchupRunning = false
       }
     }
     // WhatsApp can end a link without a LOGOUT event (a fresh link can drop after a few minutes and
@@ -555,6 +718,12 @@ const initializeEvents = (client, sessionId) => {
     client.on('disconnected', (reason) => {
       clearInterval(lastSeenTimer)
       lastSeenTimer = null
+      clearInterval(catchupTimer)
+      catchupTimer = null
+      clearInterval(catchupRecentTimer)
+      catchupRecentTimer = null
+      for (const t of targetedPending.values()) clearTimeout(t)
+      targetedPending.clear()
       // LOGOUT: unlinked from the phone's Linked devices. Other reasons (NAVIGATION, CONFLICT,
       // a crashed page) keep the login and reconnect, so they are not a removal.
       if (['LOGOUT', 'UNPAIRED'].includes(reason)) {

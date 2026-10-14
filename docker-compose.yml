@@ -47,6 +47,12 @@ services:
       LOG_LEVEL: ${WWEBJS_LOG_LEVEL:-info}
       # Catch-up after a restart re-sends voice notes at most this old.
       CATCHUP_MAX_SECONDS: ${CATCHUP_MAX_SECONDS:-3600}
+      # Re-scan recent chats for voice notes WhatsApp delayed to the linked device.
+      CATCHUP_INTERVAL_SECONDS: ${CATCHUP_INTERVAL_SECONDS:-120}
+      CATCHUP_LOOKBACK_SECONDS: ${CATCHUP_LOOKBACK_SECONDS:-1800}
+      # Short aggressive scan for brand-new chats (in addition to the 2m/30m scan).
+      CATCHUP_RECENT_INTERVAL_SECONDS: ${CATCHUP_RECENT_INTERVAL_SECONDS:-20}
+      CATCHUP_RECENT_LOOKBACK_SECONDS: ${CATCHUP_RECENT_LOOKBACK_SECONDS:-300}
     volumes:
       - wwebjs-sessions:/usr/src/app/sessions
       - ./wwebjs-api/sessions.js:/usr/src/app/src/sessions.js:ro
