@@ -409,20 +409,56 @@ def send_reply(session_id, chat_id, msg_id, text, quote=True):
         raise ReplyUnknown(f"wwebjs {type(e).__name__}: {e}") from e
 
 
+def _norm_ws(s):
+    return " ".join((s or "").split())
+
+
+def fetch_recent_chat_messages(job):
+    """Recent messages in job's chat (same scan already_transcribed uses). Raises on failure."""
+    limit = CATCHUP_SCAN_LIMIT if job.get("check_existing") else DEDUPE_SCAN_LIMIT
+    r = post_json(f"{WWEBJS_URL}/chat/fetchMessages/{job['session_id']}",
+                  {"chatId": job["chat_id"], "searchOptions": {"limit": limit}},
+                  {"x-api-key": WWEBJS_API_KEY}, timeout=REPLY_TIMEOUT_S)
+    return r.get("messages") or []
+
+
 def already_transcribed(job):
     """True if the chat already has a transcript quoting this voice note, posted by any
     account running this service (another of our sessions or someone else's deployment)."""
     try:
-        limit = CATCHUP_SCAN_LIMIT if job.get("check_existing") else DEDUPE_SCAN_LIMIT
-        r = post_json(f"{WWEBJS_URL}/chat/fetchMessages/{job['session_id']}",
-                      {"chatId": job["chat_id"], "searchOptions": {"limit": limit}},
-                      {"x-api-key": WWEBJS_API_KEY}, timeout=REPLY_TIMEOUT_S)
+        messages = fetch_recent_chat_messages(job)
     except Exception as e:
         log.warning("%s could not check chat for an existing transcript: %s", job["id"], e)
         return False  # a rare duplicate beats a missing transcript
     return any((m.get("_data") or {}).get("quotedStanzaID") == job["msg_key"]
                and (m.get("body") or "").startswith(TRANSCRIPT_MARKER)
-               for m in r.get("messages") or [])
+               for m in messages)
+
+
+def same_transcript_already_posted(job, text):
+    """True if we already posted this exact reply quoting job's voice note.
+
+    Used right before send so a concurrent worker that posted the same text cannot
+    double-post. Skips only on SAME normalized body (REPLY_PREFIX + transcript);
+    a quote with different text does not block. Prefer from-us messages when fromMe
+    is present; messages without fromMe still count (fetch payloads vary).
+    """
+    if not job.get("msg_key"):
+        return False
+    expected = _norm_ws(REPLY_PREFIX + text)
+    try:
+        messages = fetch_recent_chat_messages(job)
+    except Exception as e:
+        log.warning("%s could not check chat for a duplicate quote reply: %s", job["id"], e)
+        return False  # a rare duplicate beats a missing transcript
+    for m in messages:
+        if (m.get("_data") or {}).get("quotedStanzaID") != job["msg_key"]:
+            continue
+        if m.get("fromMe") is False:
+            continue
+        if _norm_ws(m.get("body") or "") == expected:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- pairing / removal e-mails
@@ -544,6 +580,11 @@ def process(job):
         if check and already_transcribed(job):  # may have landed while STT ran
             finish(job_id, "skipped", last_error=None)
             log.info("%s transcribed by someone else during STT, skipping", job_id)
+            return
+        # Always re-check right before send: same-text quote (incl. from_me / concurrent worker).
+        if job["msg_key"] and same_transcript_already_posted(job, text):
+            finish(job_id, "skipped", last_error=None)
+            log.info("%s skipping duplicate quote reply (same transcript already posted)", job_id)
             return
         try:
             paced_send_reply(job["session_id"], job["chat_id"], job_id, REPLY_PREFIX + text)

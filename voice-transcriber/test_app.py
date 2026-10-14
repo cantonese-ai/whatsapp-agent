@@ -134,13 +134,20 @@ class FakeBackends:
     def send(self, h, body):
         req = json.loads(body)
         quoted = (req.get("options") or {}).get("quotedMessageId")
+        content = req["content"]
         with self.lock:
             self.replies.append({"session": h.path.rsplit("/", 1)[1], "chat": req["chatId"], "t": time.time(),
-                                 "quoted": quoted, "content": req["content"], "key": h.headers.get("x-api-key")})
+                                 "quoted": quoted, "content": content, "key": h.headers.get("x-api-key")})
             plan = self.reply_plan.get(quoted) or []
             step = plan.pop(0) if plan else {}
+            code = step.get("code", 200)
+            # Only successful sends land in chat (so same_transcript_already_posted can
+            # see a concurrent worker's post the way WhatsApp would).
+            if code == 200 and quoted is not None:
+                self.chat_messages = list(self.chat_messages) + [
+                    {"body": content, "fromMe": True, "_data": {"quotedStanzaID": quoted}}]
         time.sleep(step.get("delay", 0))
-        h.respond(step.get("code", 200), step.get("body", {"success": step.get("code", 200) == 200}))
+        h.respond(code, step.get("body", {"success": code == 200}))
 
     def fetch(self, h, body):
         with self.lock:
@@ -367,6 +374,41 @@ class TestAlreadyTranscribed(AppUnitTest):
         self.assertFalse(self.check([], status=500))
         self.app.WWEBJS_URL = self.dead_url()
         self.assertFalse(self.app.already_transcribed(self.job))
+
+
+class TestSameTranscriptAlreadyPosted(AppUnitTest):
+    job = {"id": "true_c_K1", "session_id": "demo", "chat_id": "c@g.us", "msg_key": "K1"}
+
+    def check(self, messages, text="字", status=200):
+        self.fake.chat_messages, self.fake.fetch_status = messages, status
+        return self.app.same_transcript_already_posted(self.job, text)
+
+    def test_same_quoted_text(self):
+        self.assertTrue(self.check([{"body": "📝 字", "fromMe": True, "_data": {"quotedStanzaID": "K1"}}]))
+
+    def test_same_text_whitespace_normalized(self):
+        self.assertTrue(self.check(
+            [{"body": "📝   字  " + chr(10), "fromMe": True, "_data": {"quotedStanzaID": "K1"}}],
+            text="  字 "))
+
+
+    def test_different_quoted_text_does_not_count(self):
+        self.assertFalse(self.check([{"body": "📝 other", "fromMe": True, "_data": {"quotedStanzaID": "K1"}}]))
+
+    def test_same_text_not_from_us_does_not_count(self):
+        self.assertFalse(self.check([{"body": "📝 字", "fromMe": False, "_data": {"quotedStanzaID": "K1"}}]))
+
+    def test_same_text_without_from_me_counts(self):
+        # fetch payloads sometimes omit fromMe; still treat as a duplicate to avoid double-post
+        self.assertTrue(self.check([{"body": "📝 字", "_data": {"quotedStanzaID": "K1"}}]))
+
+    def test_wrong_quote_target(self):
+        self.assertFalse(self.check([{"body": "📝 字", "fromMe": True, "_data": {"quotedStanzaID": "K2"}}]))
+
+    def test_errors_mean_not_found(self):
+        self.assertFalse(self.check([], status=500))
+        self.app.WWEBJS_URL = self.dead_url()
+        self.assertFalse(self.app.same_transcript_already_posted(self.job, "字"))
 
 
 class TestAcceptMedia(AppUnitTest):
@@ -881,13 +923,43 @@ class EndToEnd(unittest.TestCase):
         self.send(voice_event("1", from_me=True, key="K1", catch_up=True))
         self.wait_status("m1", "done")
         self.assertEqual((self.fake.stt_calls, len(self.fake.replies)), (["1"], 1))
-        self.assertEqual(len(self.fake.fetches), 2)  # checked before STT and before replying
+        self.assertEqual(len(self.fake.fetches), 3)  # already_transcribed x2 + same-text check before send
 
-    def test_own_note_is_not_checked(self):
-        self.fake.chat_messages = [{"body": "📝 x", "_data": {"quotedStanzaID": "K1"}}]
+    def test_own_note_skips_early_dedupe_but_checks_same_text_before_send(self):
+        # Own notes skip already_transcribed early; still STT, then same-text check before reply.
+        # Different body so we still post.
+        self.fake.chat_messages = [{"body": "📝 x", "fromMe": True, "_data": {"quotedStanzaID": "K1"}}]
         self.send(voice_event("1", from_me=True, key="K1"))
         self.wait_status("m1", "done")
-        self.assertEqual(self.fake.fetches, [])
+        self.assertEqual(self.fake.stt_calls, ["1"])
+        self.assertEqual(len(self.fake.replies), 1)
+        self.assertEqual(len(self.fake.fetches), 1)
+
+    def test_same_transcript_quote_already_posted_skips_send(self):
+        # from_me: no early already_transcribed; after STT the same reply text is already in chat.
+        self.fake.stt_plan["1"] = [{"text": "hello"}]
+        self.fake.chat_messages = [{"body": "📝 hello", "fromMe": True, "_data": {"quotedStanzaID": "K1"}}]
+        self.send(voice_event("1", from_me=True, key="K1"))
+        self.wait_status("m1", "skipped")
+        self.assertEqual(self.fake.stt_calls, ["1"])
+        self.assertEqual(self.fake.replies, [])
+
+    def test_different_transcript_quote_still_posts(self):
+        self.fake.stt_plan["1"] = [{"text": "hello"}]
+        self.fake.chat_messages = [{"body": "📝 earlier different", "fromMe": True,
+                                   "_data": {"quotedStanzaID": "K1"}}]
+        self.send(voice_event("1", from_me=True, key="K1"))
+        self.wait_status("m1", "done")
+        self.assertEqual(len(self.fake.replies), 1)
+        self.assertEqual(self.fake.replies[0]["content"], "📝 hello")
+
+    def test_no_quote_still_posts(self):
+        self.fake.stt_plan["1"] = [{"text": "hello"}]
+        self.fake.chat_messages = []
+        self.send(voice_event("1", from_me=True, key="K1"))
+        self.wait_status("m1", "done")
+        self.assertEqual(len(self.fake.replies), 1)
+        self.assertEqual(self.fake.replies[0]["content"], "📝 hello")
 
     def test_two_of_our_numbers_in_one_chat_one_transcript(self):
         # Receivers wait (as with the default DEFER_*), so the sender's copy can take over.
