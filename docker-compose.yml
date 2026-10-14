@@ -53,9 +53,14 @@ services:
       # Short aggressive scan for brand-new chats (in addition to the 2m/30m scan).
       CATCHUP_RECENT_INTERVAL_SECONDS: ${CATCHUP_RECENT_INTERVAL_SECONDS:-20}
       CATCHUP_RECENT_LOOKBACK_SECONDS: ${CATCHUP_RECENT_LOOKBACK_SECONDS:-300}
+      # Hard deadline so hung getChats cannot stick catchupRunning forever.
+      CATCHUP_TIMEOUT_MS: ${CATCHUP_TIMEOUT_MS:-45000}
+      PUPPETEER_LAUNCH_TIMEOUT_MS: ${PUPPETEER_LAUNCH_TIMEOUT_MS:-120000}
+      PUPPETEER_PROTOCOL_TIMEOUT_MS: ${PUPPETEER_PROTOCOL_TIMEOUT_MS:-180000}
     volumes:
       - wwebjs-sessions:/usr/src/app/sessions
       - ./wwebjs-api/sessions.js:/usr/src/app/src/sessions.js:ro
+      - ./wwebjs-api/catchup.js:/usr/src/app/src/catchup.js:ro
     # Chromium crashes with Docker's default 64 MB /dev/shm.
     shm_size: 512mb
     ports:

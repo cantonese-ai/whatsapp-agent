@@ -25,6 +25,7 @@
 //     targeted per-chat catch-up, recent aggressive scan, catch-up sorted by last activity
 //   - catch-up dedupes in-process (no re-POST of already-webhooked msg ids); prefer recent
 //     over full when the shared catch-up lock is contended
+//   - catch-up hard timeout (CATCHUP_TIMEOUT_MS, default 45000) + watchdog (2x) clears catchupRunning if getChats/scan hangs
 // The per-session webhook override (<SESSIONID>_WEBHOOK_URL) is upstream behaviour and is also
 // used for the new events. Keep this file in step with the image tag in docker-compose.yml.
 
@@ -35,6 +36,8 @@ const sessions = new Map()
 const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, proxyUrl, proxyUsername, proxyPassword } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
+const { createVoiceNoteCatchUp } = require('./catchup')
+
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
 
 // Function to validate if the session is ready
@@ -130,6 +133,9 @@ const setupSession = async (sessionId, pairWithPhoneNumber) => {
       puppeteer: {
         executablePath: chromeBin,
         headless,
+        // Under host load Chromium can exceed the default 30s WS-endpoint wait.
+        timeout: parseInt(process.env.PUPPETEER_LAUNCH_TIMEOUT_MS || '120000', 10),
+        protocolTimeout: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '180000', 10),
         args: [
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
@@ -597,9 +603,6 @@ const initializeEvents = (client, sessionId) => {
     catchupSentMaxAgeSeconds = Math.max(catchupLookbackSeconds, catchupMaxSeconds, catchupRecentLookbackSeconds) + 120
     let catchupTimer = null
     let catchupRecentTimer = null
-    let catchupRunning = false
-    let catchupRunningMode = null
-    let catchupRecentPending = null // { delayMs } — run recent after a contended full scan
     const targetedPending = new Map() // chatId -> timeout
     const targetedInFlight = new Set()
 
@@ -715,24 +718,18 @@ const initializeEvents = (client, sessionId) => {
         setTimeout(() => catchUp(from, delayMs, 'ready'), delayMs)
       }
     })
-    const catchUp = async (from, delayMs, mode = 'full') => {
-      if (catchupRunning) {
-        // Prefer recent/targeted freshness: defer a recent scan to run right after the
-        // current one instead of dropping it behind a long full scan.
-        if (mode === 'recent') {
-          catchupRecentPending = { delayMs }
-          logger.info({ sessionId, mode, running: catchupRunningMode }, 'Voice note catch-up deferred (will run after current)')
-        } else {
-          logger.info({ sessionId, mode, running: catchupRunningMode }, 'Voice note catch-up skipped (already running)')
-        }
-        return
-      }
-      catchupRunning = true
-      catchupRunningMode = mode
-      let sent = 0
-      let skippedAlready = 0
-      let scanned = 0
-      try {
+    // cantonese.ai patch: hard deadline + watchdog so a hung getChats/scanChat cannot hold
+    // catchupRunning forever and starve status/keep-alive under Puppeteer stalls.
+    const CATCHUP_TIMEOUT_MS = parseInt(process.env.CATCHUP_TIMEOUT_MS || '45000', 10)
+    const voiceCatchUp = createVoiceNoteCatchUp({
+      sessionId,
+      logger,
+      timeoutMs: CATCHUP_TIMEOUT_MS,
+      recentFromSeconds: () => {
+        const now = Math.floor(Date.now() / 1000)
+        return now - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
+      },
+      runScan: async (from, mode, delayMs, { deadline, isTimedOut }) => {
         pruneCatchupSent()
         const chats = await client.getChats()
         // Newest activity first: brand-new chats otherwise sit at the end of a long scan.
@@ -740,7 +737,15 @@ const initializeEvents = (client, sessionId) => {
         // Full scans can starve recent work; cap chat fetches now that in-process dedupe
         // means we mostly confirm emptiness rather than re-send.
         const scanCap = mode === 'recent' ? 25 : 80
+        let sent = 0
+        let skippedAlready = 0
+        let scanned = 0
         for (const chat of chats) {
+          if (isTimedOut()) {
+            const err = new Error('catch-up timed out')
+            err.code = 'CATCHUP_TIMEOUT'
+            throw err
+          }
           if (!chat.timestamp || chat.timestamp < from || chat.id?._serialized === 'status@broadcast') continue
           scanned++
           const result = await scanChatVoiceNotes(chat, from)
@@ -748,21 +753,11 @@ const initializeEvents = (client, sessionId) => {
           skippedAlready += result.skippedAlready
           if (scanned >= scanCap) break
         }
-        logger.info({ sessionId, since: from, sent, skippedAlready, scanned, mode, afterSeconds: delayMs / 1000, remembered: catchupSentKeys.size }, 'Voice note catch-up done')
-      } catch (err) {
-        logger.error({ sessionId, err, mode }, 'Voice note catch-up failed')
-      } finally {
-        catchupRunning = false
-        catchupRunningMode = null
-        if (catchupRecentPending) {
-          const pending = catchupRecentPending
-          catchupRecentPending = null
-          const now = Math.floor(Date.now() / 1000)
-          const fromRecent = now - Math.min(catchupRecentLookbackSeconds, catchupMaxSeconds)
-          setImmediate(() => { catchUp(fromRecent, pending.delayMs, 'recent') })
-        }
+        return { sent, skippedAlready, scanned, remembered: catchupSentKeys.size }
       }
-    }
+    })
+    const catchUp = (from, delayMs, mode = 'full') => voiceCatchUp.catchUp(from, delayMs, mode)
+
     // WhatsApp can end a link without a LOGOUT event (a fresh link can drop after a few minutes and
     // the page reloads unpaired). A paired session asking for a QR code, or failing authentication,
     // has been unlinked.
@@ -783,6 +778,7 @@ const initializeEvents = (client, sessionId) => {
       catchupTimer = null
       clearInterval(catchupRecentTimer)
       catchupRecentTimer = null
+      try { voiceCatchUp.dispose() } catch (_) {}
       for (const t of targetedPending.values()) clearTimeout(t)
       targetedPending.clear()
       // LOGOUT: unlinked from the phone's Linked devices. Other reasons (NAVIGATION, CONFLICT,
